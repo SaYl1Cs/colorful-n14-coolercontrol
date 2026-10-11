@@ -34,8 +34,8 @@ sudo pacman -S --needed coolercontrol acpi_call
 Затем выполните:
 
 ```bash
-git clone <URL-ЭТОГО-РЕПОЗИТОРИЯ>
-cd nbfc-n14-control
+git clone https://github.com/SaYl1Cs/colorful-n14-coolercontrol.git
+cd colorful-n14-coolercontrol
 sudo ./install.sh
 ```
 
