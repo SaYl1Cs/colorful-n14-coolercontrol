@@ -1,0 +1,492 @@
+--- original/build_profile.py
++++ derivative/build_profile.py
+@@ -1,13 +1,19 @@
+-"""Build an experimental nbfc-linux profile. Does not access hardware."""
++"""Build ONLY the pinned N14 derivative from validated curves; entirely offline."""
+ import json
++import os
+ from pathlib import Path
++import tempfile
++
++from curves import CURVES_PATH, load_curves, validate_curves
+
+ ROOT = Path(__file__).resolve().parent
+-PROFILE_ID = "Colorful N14 24 - BIOS 2.07 - ACPI EXPERIMENTAL"
++PROFILE_ID = "Colorful N14 24 - Temperature Curves - GPU Command Readback"
++PROFILE_PATH = ROOT / "configs" / (PROFILE_ID + ".json")
+ UPSTREAM = "59b4b4ffacf125cc79c8c7740ff2f2f8ff1343f7"
+
+
+-def build():
++def build(curves=None):
++    curves = load_curves() if curves is None else validate_curves(curves)
+     common = (ROOT / "src" / "transport.lua").read_text(encoding="utf-8")
+
+     def lua(expression, bootstrap=False, cleanup=False):
+@@ -19,10 +25,10 @@
+             prefix = 'if not N14 then return "N14: read initialization missing", 0 end'
+         return (prefix + "\nreturn " + expression + "\n").splitlines()
+
+-    def fan(name, sensor, read_index, write_index, critical, rows):
++    def fan(name, sensor, reader, write_index, critical, rows):
+         return {
+             "FanDisplayName": name,
+-            "ReadLuaCode": lua(f"N14.read({read_index})", bootstrap=True),
++            "ReadLuaCode": lua(f"N14.{reader}()", bootstrap=True),
+             "WriteLuaCode": lua(f"N14.write({write_index}, get_value())"),
+             "ResetRequired": True,
+             "ResetLuaCode": lua("N14.reset()", cleanup=True),
+@@ -34,20 +40,20 @@
+             "CriticalTemperatureOffset": 5,
+             "TemperatureAlgorithmType": "Max",
+             "Sensors": [sensor],
+-            "TemperatureThresholds": [
+-                {"UpThreshold": up, "DownThreshold": down, "FanSpeed": speed}
+-                for up, down, speed in rows
+-            ],
++            "TemperatureThresholds": rows,
+         }
+
+     return {
+         "NotebookModel": "N14 24",
+         "Author": "Experimental community profile; hardware validation pending",
+         "Comment": (
+-            "ONLY COLORFUL N14 24 BIOS 2.07, reported EC 2.0. Requires prepare.py permission. "
+-            "Not validated on hardware. Controlled shutdown requests BOTH fans full, NOT Normal. "
+-            "No fan stop: writes are clamped to >=40% nominal. Nominal maximum is SDK target 7000 RPM, "
+-            "not a measured maximum. Use only with the documented nbfc-linux implementation."
++            "ONLY COLORFUL N14 24 BIOS 2.07, SMBIOS EC 2.0, controller 55:71; indexed I/O 0x302. "
++            "Requires prepare.py permission and exact DSDT/WMI/DMI verification. "
++            "GPU percentage is actual command register 0x55 / 70, NOT RPM or verified rotation. "
++            "Temperature control WITHOUT verified GPU rotation feedback. GPU RPM UNKNOWN. "
++            "Derivative not hardware-tested. Cleanup requests BOTH fans full, NOT Normal. "
++            "First stage: minimum 40%; 0% unverified and disabled; no calibration. "
++            f"ONLY nbfc-linux 0.5.3 commit {UPSTREAM}."
+         ),
+         "EcPollInterval": 1000,
+         "CriticalTemperature": 85,
+@@ -56,24 +62,58 @@
+         "LegacyTemperatureThresholdsBehaviour": False,
+         "LuaLibraries": ["base", "math", "string", "io"],
+         "FanConfigurations": [
+-            fan("CPU - nominal RPM/7000", "@CPU", 0x5C, 0x54, 90,
+-                [(45, 0, 40), (60, 40, 50), (70, 55, 65), (80, 65, 80), (90, 75, 100)]),
+-            fan("GPU - unverified tachometer", "@GPU", 0x5D, 0x55, 80,
+-                [(45, 0, 40), (55, 40, 50), (65, 50, 65), (72, 60, 80), (80, 67, 100)]),
++            fan("CPU - nominal RPM/7000", "@CPU", "read_cpu_tach", 0x54, 90, curves["CPU"]),
++            fan("GPU - command readback, RPM UNKNOWN", "@GPU", "read_gpu_command", 0x55, 80, curves["GPU"]),
+         ],
+         "RegisterWriteConfigurations": [],
+     }
+
+
++def profile_text(curves=None):
++    text = json.dumps(build(curves), ensure_ascii=False, indent=2, allow_nan=False) + "\n"
++    if len(text.encode("utf-8")) >= 32768:
++        raise ValueError("Profile exceeds pinned nbfc-linux file size limit")
++    return text
++
++
++def atomic_write(path, text):
++    path = Path(path)
++    if path.is_symlink():
++        raise ValueError("Refusing to overwrite a symlink")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as stream:
++            stream.write(text)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, path)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
++
++
++def save_curves_and_build(data):
++    clean = validate_curves(data)
++    text = profile_text(clean)  # All validation, including size, before any writes.
++    atomic_write(CURVES_PATH, json.dumps(clean, indent=2, allow_nan=False) + "\n")
++    atomic_write(PROFILE_PATH, text)
++    return PROFILE_PATH
++
++
++def export_profile(data, destination):
++    # Export generated data only; never import arbitrary profile/Lua fields.
++    destination = Path(destination)
++    if destination.suffix.lower() != ".json":
++        raise ValueError("Export must be a .json file")
++    # Do not let an export overwrite curve input or any project source/provenance.
++    if destination.resolve().is_relative_to(ROOT.resolve()) and destination.resolve() != PROFILE_PATH.resolve():
++        raise ValueError("Export outside the project, or use the generated profile path")
++    atomic_write(destination, profile_text(data))
++
++
+ def main():
+-    target = ROOT / "configs"
+-    target.mkdir(exist_ok=True)
+-    profile = target / (PROFILE_ID + ".json")
+-    text = json.dumps(build(), ensure_ascii=False, indent=2) + "\n"
+-    if len(text.encode("utf-8")) >= 32768:
+-        raise RuntimeError("Profile exceeds pinned nbfc-linux file size limit")
+-    profile.write_text(text, encoding="utf-8")
+-    print(profile)
++    atomic_write(PROFILE_PATH, profile_text())
++    print(PROFILE_PATH)
+
+
+ if __name__ == "__main__":
+--- original/prepare.py
++++ derivative/prepare.py
+@@ -2,24 +2,78 @@
+
+ Default 'check' does not invoke firmware. 'probe' and 'arm' issue diagnostic
+ indexed reads (index-port writes, but no fan setting writes). This script never
+-starts NBFC, installs software, writes fan settings, or enables a service.
++installs software, writes fan settings, or enables a service. ONLY the explicit
++--launch option used by the hardware launchers executes the pinned NBFC binary.
++Do not run this script during offline editing/testing.
+ """
+ import argparse
++from contextlib import contextmanager
++import fcntl
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
+ import re
+-import shutil
++import stat
+ import struct
+ import sys
++
++from build_profile import PROFILE_ID, build
+
+ ROOT = Path(__file__).resolve().parent
+ DSDT_SHA256 = "4aab3c89fdaac8ab9e20d31cff3fe0a18b83877442520eb294429ff9237bef06"
+ GUID = "3161c7c3-489f-4074-82ae-538101cce1c2"
+ METHOD = r"\_SB.AMW0.WMBA"
+-PERMISSION_DIR = Path("/run/colorful-n14-nbfc")
+-PROFILE_ID = "Colorful N14 24 - BIOS 2.07 - ACPI EXPERIMENTAL"
++PERMISSION_DIR = Path("/run/colorful-n14-curves")
++NBFC_SERVICE = "/usr/local/bin/nbfc_service"
++EXPECTED_EC_ID = (0x55, 0x71)
++SMBIOS_RAW = Path("/sys/firmware/dmi/entries/0-0/raw")
++
++
++def smbios_ec_version(data):
++    # SMBIOS Type 0 (BIOS Information), EC firmware release at offsets 22/23.
++    if len(data) < 24 or data[0] != 0 or not 24 <= data[1] <= len(data):
++        raise RuntimeError("Missing/truncated SMBIOS Type 0 EC firmware release")
++    version = tuple(data[22:24])
++    if version != (2, 0):
++        raise RuntimeError(f"SMBIOS EC firmware must be 2.0, got {version}")
++    return "2.0"
++
++
++def matches_wmi_name(name):
++    return re.fullmatch(re.escape(GUID) + r"(?:[-:][0-9]+)?", name.lower()) is not None
++
++
++def ensure_runtime_dir():
++    PERMISSION_DIR.mkdir(mode=0o700, exist_ok=True)
++    info = PERMISSION_DIR.lstat()
++    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
++        raise RuntimeError("Permission directory must be root-owned and not a symlink")
++    os.chmod(PERMISSION_DIR, 0o700)
++
++
++@contextmanager
++def session_lock():
++    """Serialize new preflights; launcher retains lock across foreground exec.
++
++    All legacy NBFC processes are additionally rejected by the global PID/process
++    check. This cannot coordinate arbitrary other ACPI utilities or modified
++    legacy launchers: never run those concurrently.
++    """
++    ensure_runtime_dir()
++    fd = os.open(PERMISSION_DIR / "session.lock",
++                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
++    try:
++        info = os.fstat(fd)
++        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
++            raise RuntimeError("Invalid session lock file")
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError as exc:
++            raise RuntimeError("Another curves preparation/session is already running") from exc
++        yield fd
++    finally:
++        os.close(fd)
+
+
+ def packet(address, index=None):
+@@ -73,8 +127,10 @@
+         try:
+             if (p / "comm").read_text().strip() == "nbfc_service":
+                 raise RuntimeError("An nbfc_service process is already running")
+-        except (FileNotFoundError, PermissionError, ProcessLookupError):
++        except (FileNotFoundError, ProcessLookupError):
+             pass
++        except PermissionError as exc:
++            raise RuntimeError("Cannot verify absence of other NBFC processes") from exc
+
+
+ def check_platform():
+@@ -85,19 +141,23 @@
+     actual = {key: (dmi / key).read_text().strip() for key in expected}
+     if actual != expected:
+         raise RuntimeError(f"Unsupported platform: {actual}")
++    ec_version = smbios_ec_version(SMBIOS_RAW.read_bytes())
+     data = Path("/sys/firmware/acpi/tables/DSDT").read_bytes()
+     if hashlib.sha256(data).hexdigest() != DSDT_SHA256:
+         raise RuntimeError("DSDT hash mismatch: no override is provided; inspect the new firmware first")
+     devices = Path("/sys/bus/wmi/devices")
+-    if not devices.is_dir() or not any(re.fullmatch(re.escape(GUID) + r"(?:(?:-|:)\d+)?", p.name.lower()) is not None for p in devices.iterdir()):
++    if not devices.is_dir() or not any(matches_wmi_name(p.name) for p in devices.iterdir()):
+         raise RuntimeError("Expected WMI interface is absent")
+     profile = ROOT / "configs" / (PROFILE_ID + ".json")
+     if not profile.is_file():
+         raise RuntimeError("Generated profile missing; run build_profile.py first")
++    if json.loads(profile.read_text(encoding="utf-8")) != build():
++        raise RuntimeError("Profile differs from validated local build; rebuild before preparation")
+     print(json.dumps({"platform": actual, "dsdt_sha256": DSDT_SHA256,
+-                      "nbfc_service": shutil.which("nbfc_service"),
++                      "nbfc_service": NBFC_SERVICE,
+                       "acpi_call_loaded": Path("/proc/acpi/call").exists(),
+-                      "ec_version": "NOT detected; user must confirm EC 2.0"}, indent=2))
++                      "smbios_ec_version": ec_version,
++                      "gpu_feedback": "command readback only; RPM UNKNOWN"}, indent=2))
+     return profile
+
+
+@@ -108,10 +168,9 @@
+
+
+ def write_permission(brand, control, profile):
+-    PERMISSION_DIR.mkdir(mode=0o700, exist_ok=True)
+-    if PERMISSION_DIR.is_symlink() or PERMISSION_DIR.stat().st_uid != 0:
+-        raise RuntimeError("Permission directory must be root-owned and not a symlink")
+-    os.chmod(PERMISSION_DIR, 0o700)
++    if brand != EXPECTED_EC_ID:
++        raise RuntimeError("Only observed controller ID 55:71 is supported")
++    ensure_runtime_dir()
+     access = "control" if control else "read"
+     text = f"{DSDT_SHA256} {brand[0]:02x} {brand[1]:02x} {access}\n"
+     tmp = PERMISSION_DIR / "permission.new"
+@@ -141,37 +200,52 @@
+     parser.add_argument("--sensors-verified", action="store_true", help="Confirm BOTH correct CPU and NVIDIA GPU sources worked in read-only mode")
+     parser.add_argument("--expected-ec-id", type=parse_brand, help="Exact controller ID printed by prior probe")
+     parser.add_argument("--ec-version", help="User-confirmed EC firmware version; must be 2.0")
++    parser.add_argument("--launch", choices=(NBFC_SERVICE,),
++                        help="Hardware launcher only: explicitly exec pinned foreground service")
+     args = parser.parse_args(argv)
++    if args.launch and args.action == "check":
++        parser.error("check cannot launch NBFC")
+     if args.action != "check" and not args.acknowledge_risk:
+         parser.error("Diagnostic indexed reads require --acknowledge-risk; stop other EC/ACPI tools first")
+-    if args.action == "arm" and (not args.sensors_verified or args.expected_ec_id is None or args.ec_version != "2.0"):
+-        parser.error("arm requires --sensors-verified, --expected-ec-id from a prior probe, and --ec-version 2.0")
++    if args.action == "arm" and (not args.sensors_verified or args.expected_ec_id != EXPECTED_EC_ID or args.ec_version != "2.0"):
++        parser.error("arm requires --sensors-verified, --expected-ec-id 55:71 from prior probe, and --ec-version 2.0")
+     try:
+         profile = check_platform()
+         if args.action == "check":
+             return 0
+-        assert_service_stopped()
+-        if not Path("/proc/acpi/call").exists():
+-            raise RuntimeError("Load a compatible acpi_call module before diagnostic reads")
+-        # Invalidate any old permission before starting a new diagnostic session.
+-        old = PERMISSION_DIR / "permission"
+-        if old.exists():
+-            old.unlink()
+-        brand = (read_byte(packet(0x2E, 0x20)), read_byte(packet(0x2E, 0x21)))
+-        if brand in ((0, 0), (255, 255)):
+-            raise RuntimeError(f"Implausible controller ID: {brand}")
+-        if args.action == "arm" and brand != args.expected_ec_id:
+-            raise RuntimeError("Controller ID differs from prior probe; no control permission written")
+-        values = []
+-        for index in (0x5C, 0x5D):
+-            data = packet(4262166784 + index) if brand == (0x20, 0x10) else packet(0x302, index)
+-            values.append(read_byte(data))
+-        print(json.dumps({"ec_id": "%02X:%02X" % brand,
+-                          "transport": "memory" if brand == (0x20, 0x10) else "indexed-io",
+-                          "cpu_rpm": values[0] * 100, "gpu_rpm": values[1] * 100}, indent=2))
+-        if any(value > 70 for value in values):
+-            raise RuntimeError("RPM outside experimental 0..7000 range; investigate before enabling this profile")
+-        write_permission(brand, args.action == "arm", profile)
++        with session_lock() as lock_fd:
++            assert_service_stopped()  # Includes old profile and foreground instances.
++            if not Path("/proc/acpi/call").exists():
++                raise RuntimeError("Load a compatible acpi_call module before diagnostic reads")
++            # Invalidate any old permission before starting a new diagnostic session.
++            old = PERMISSION_DIR / "permission"
++            old.unlink(missing_ok=True)
++            brand = (read_byte(packet(0x2E, 0x20)), read_byte(packet(0x2E, 0x21)))
++            if brand != EXPECTED_EC_ID:
++                raise RuntimeError("Controller ID is not pinned observed 55:71; no permission written")
++            if args.action == "arm" and brand != args.expected_ec_id:
++                raise RuntimeError("Controller ID differs from prior probe; no control permission written")
++            cpu_tach = read_byte(packet(0x302, 0x5C))
++            gpu_command = read_byte(packet(0x302, 0x55))
++            if not 0 <= cpu_tach <= 70:
++                raise RuntimeError("CPU tachometer outside experimental 0..7000 RPM range")
++            if not 0 <= gpu_command <= 70:
++                raise RuntimeError("GPU command outside 0..70; RPM UNKNOWN")
++            print(json.dumps({"ec_id": "%02X:%02X" % brand,
++                              "transport": "indexed-io", "cpu_rpm_nominal": cpu_tach * 100,
++                              "gpu_command": gpu_command,
++                              "gpu_command_percent": gpu_command * 100 / 70,
++                              "gpu_rpm": None, "gpu_feedback": "RPM UNKNOWN; rotation not verified"}, indent=2))
++            write_permission(brand, args.action == "arm", profile)
++            if args.launch:
++                assert_service_stopped()  # Recheck immediately before exec.
++                command = [NBFC_SERVICE]
++                if args.action == "probe":
++                    command.append("--read-only")
++                command.extend(["--config-file", str(PERMISSION_DIR / "service.json")])
++                print("Explicit hardware launch. GPU RPM UNKNOWN. Control cleanup requests BOTH fans FULL.", flush=True)
++                os.set_inheritable(lock_fd, True)
++                os.execv(NBFC_SERVICE, command)  # No shell, PATH search, sudo, or service manager.
+         return 0
+     except (OSError, RuntimeError, ValueError) as exc:
+         print(f"STOP: {exc}", file=sys.stderr)
+--- original/run-control.sh
++++ derivative/run-control.sh
+@@ -5,7 +5,8 @@
+ cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+ command -v python3 >/dev/null
+ test -x /usr/local/bin/nbfc_service
+-python3 prepare.py arm "$@"
+-printf '\nWARNING: REAL FAN CONTROL. Ctrl+C requests BOTH fans FULL on graceful cleanup.\n'
++printf '\nWARNING: REAL FAN CONTROL. GPU RPM UNKNOWN; 40%% minimum; 0%% unverified.\n'
++printf 'Ctrl+C requests BOTH fans FULL on graceful cleanup after control writes.\n'
+ printf 'Stay present. Do not suspend, hibernate, or stress-test the laptop.\n'
+-exec /usr/local/bin/nbfc_service --config-file /run/colorful-n14-nbfc/service.json
++# prepare retains the exclusive session lock across exec of this fixed binary.
++exec python3 prepare.py arm --launch /usr/local/bin/nbfc_service "$@"
+--- original/run-read-only.sh
++++ derivative/run-read-only.sh
+@@ -4,6 +4,6 @@
+ cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+ command -v python3 >/dev/null
+ test -x /usr/local/bin/nbfc_service
+-python3 prepare.py probe "$@"
+-printf '\nStarting NBFC READ-ONLY in foreground. Ctrl+C stops diagnostics.\n'
+-exec /usr/local/bin/nbfc_service --read-only --config-file /run/colorful-n14-nbfc/service.json
++printf '\nEXPLICIT HARDWARE DIAGNOSTICS, not offline. GPU command feedback is NOT RPM.\n'
++# prepare retains the exclusive session lock across exec of this fixed binary.
++exec python3 prepare.py probe --launch /usr/local/bin/nbfc_service "$@"
+--- original/src/transport.lua
++++ derivative/src/transport.lua
+@@ -1,4 +1,5 @@
+--- Experimental N14 24 / BIOS 2.07 transport for nbfc-linux.
++-- Pinned N14 24 / BIOS 2.07 / EC 2.0 / ID 55:71 transport.
++-- GPU feedback is controller command readback, NEVER verified RPM.
+ -- Included verbatim in each Lua handler by build_profile.py.
+ -- Shared Lua state is provided by the pinned upstream implementation.
+ if not N14 then
+@@ -21,17 +22,6 @@
+             .. "00000000000000"
+     end
+
+-    local function memory(address, value)
+-        local bytes = ""
+-        for i = 1, 4 do
+-            bytes = bytes .. string.format("%02x", address % 256)
+-            address = math.floor(address / 256)
+-        end
+-        return "4259444c" .. bytes .. "00000000"
+-            .. string.format("00%02x0800%02x", value ~= nil and 1 or 0, value or 0)
+-            .. "00000000000000"
+-    end
+-
+     local function call(packet)
+         if #packet ~= 48 then return "N14: invalid packet length", 0 end
+         local e, v = acpi_call(method .. packet)
+@@ -51,15 +41,25 @@
+                     return "N14: unsupported DMI/BIOS", 0
+                 end
+             end
+-            -- Created by prepare.py only after exact DSDT hash validation.
++            -- SMBIOS Type 0 offsets 0x16/0x17: EC firmware major/minor.
++            local smbios = read_file("/sys/firmware/dmi/entries/0-0/raw")
++            if not smbios or #smbios < 24 or smbios:byte(1) ~= 0
++                or smbios:byte(2) < 24 or smbios:byte(2) > #smbios
++                or smbios:byte(23) ~= 2 or smbios:byte(24) ~= 0 then
++                return "N14: SMBIOS EC firmware must be 2.0", 0
++            end
++            -- Created by prepare.py only after exact DSDT hash and WMI validation.
+             -- This is an accident-prevention guard, not a security boundary against root.
+-            local ticket = read_file("/run/colorful-n14-nbfc/permission")
++            local ticket = read_file("/run/colorful-n14-curves/permission")
+             if not ticket then return "N14: run prepare.py first (permission missing)", 0 end
+             local hash, high, low, access = ticket:match("^(%x+) (%x%x) (%x%x) (%a+)\n$")
+             if hash ~= digest or (access ~= "read" and access ~= "control") then
+                 return "N14: invalid verification ticket", 0
+             end
+             high, low = tonumber(high, 16), tonumber(low, 16)
++            if high ~= 0x55 or low ~= 0x71 then
++                return "N14: only controller ID 55:71 is supported", 0
++            end
+             local e, actual_high = call(indexed(0x2e, 0x20, nil))
+             if e then return e, 0 end
+             local actual_low
+@@ -68,10 +68,6 @@
+             if actual_high ~= high or actual_low ~= low then
+                 return "N14: controller identification changed", 0
+             end
+-            if (high == 0 and low == 0) or (high == 255 and low == 255) then
+-                return "N14: implausible controller identification", 0
+-            end
+-            N14.memory = high == 0x20 and low == 0x10
+             N14.control = access == "control"
+             N14.ready = true
+         end
+@@ -82,7 +78,6 @@
+     end
+
+     local function field(index, value)
+-        if N14.memory then return call(memory(4262166784 + index, value)) end
+         return call(indexed(0x302, index, value))
+     end
+
+@@ -93,7 +88,7 @@
+         return nil, 0
+     end
+
+-    -- Best effort: request BOTH fans at the SDK's 7000 RPM maximum.
++    -- Best effort: request BOTH fans at command 70 (100%); GPU RPM UNKNOWN.
+     -- Attempt all three operations even if one fails. Not hardware fail-safe.
+     local function request_full()
+         local first = nil
+@@ -106,16 +101,27 @@
+         return first, 0
+     end
+
+-    function N14.read(index)
+-        if index ~= 0x5c and index ~= 0x5d then return "N14: invalid tachometer index", 0 end
++    function N14.read_cpu_tach()
+         local e = N14.guard(false)
+         if e then return e, 0 end
+         local v
+-        e, v = field(index, nil)
++        e, v = field(0x5c, nil)
+         if e then return e, 0 end
+         -- Report the real value; do not synthesize RPM from the target.
+         -- >70 is outside the SDK-derived nominal scale and aborts this experiment.
+         if v > 70 then return "N14: tachometer outside unverified 0..7000 RPM range", 0 end
++        return nil, v
++    end
++
++    function N14.read_gpu_command()
++        local e = N14.guard(false)
++        if e then return e, 0 end
++        local v
++        e, v = field(0x55, nil)
++        if e then return e, 0 end
++        if v > 70 then return "N14: GPU command outside 0..70; RPM UNKNOWN", 0 end
++        -- Actual controller register read, not the last requested value or a tachometer.
++        -- Zero is reported honestly; command feedback cannot prove physical rotation.
+         return nil, v
+     end

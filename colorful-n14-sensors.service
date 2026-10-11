@@ -1,0 +1,15 @@
+[Unit]
+Description=Cache CPU and NVIDIA temperatures for Colorful N14 CoolerControl
+Requires=colorful-n14-nbfc-prepare.service
+After=colorful-n14-nbfc-prepare.service nvidia-persistenced.service
+Before=coolercontrold.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/share/colorful-n14-control/sensor_cache.py
+ExecStopPost=/usr/bin/rm -f /run/colorful-n14-control/cpu_temp /run/colorful-n14-control/gpu_temp
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

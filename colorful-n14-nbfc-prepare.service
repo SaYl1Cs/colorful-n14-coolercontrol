@@ -1,0 +1,14 @@
+[Unit]
+Description=Prepare guarded Colorful N14 24 fan control for CoolerControl
+Wants=systemd-modules-load.service
+After=systemd-modules-load.service
+Before=coolercontrold.service colorful-n14-sensors.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/modprobe acpi_call
+ExecStart=/usr/bin/python3 /usr/local/share/colorful-n14-control/prepare-autostart.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

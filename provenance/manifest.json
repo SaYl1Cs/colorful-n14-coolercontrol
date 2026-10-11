@@ -1,0 +1,16 @@
+{
+  "source": "../../../usr/local/share/nbfc/colorful-n14-nbfc",
+  "upstream_commit": "59b4b4ffacf125cc79c8c7740ff2f2f8ff1343f7",
+  "original_files_sha256": {
+    ".gitignore": "05db920bfa68ab9e81018ca9f5c30e6959ef8a62c86f987e3ea4104a32354b5f",
+    "README.md": "3d48585e6b1346feea2455ef1402823de3ec295c4a2f35b02de004011c77b3e7",
+    "build_profile.py": "16a2af4f1f72d7882579df94ccb633fcd698395c5e446fd02810c2eec182604f",
+    "configs/Colorful N14 24 - BIOS 2.07 - ACPI EXPERIMENTAL.json": "40ad6485f5752036e310143b6b7156cd422a407b3d1a80577e78f5ffb38ac5f5",
+    "prepare.py": "f926ee8b3089a9833319c2b0d0d9f0762939f6200d4bcc56fbb676fd0258f17f",
+    "run-control.sh": "d82751442f809851584c2b17d1bd93b812f655cb15f0250b2a33fc91cfacad3d",
+    "run-read-only.sh": "4a96ac967e48d7ff64ceb2345b9ad09b006dc720432750e8577bf0811b288b3e",
+    "src/transport.lua": "f59dd213ede251eead2f96b412f922f323513e80160634bd90cfa53abad842a2",
+    "tests/test_profile.py": "7a104eb7e41097c1865f03baa2ed930d99748b90d3a7f727827ed8ac810fca04"
+  },
+  "archive_sha256": "05f9798201cb7f27b083a9da831d719218a1bb8a3fa86387c28573e16c4207ee"
+}

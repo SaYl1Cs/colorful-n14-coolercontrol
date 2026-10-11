@@ -1,0 +1,165 @@
+-- Pinned N14 24 / BIOS 2.07 / EC 2.0 / ID 55:71 transport.
+-- GPU feedback is controller command readback, NEVER verified RPM.
+-- Included verbatim in each Lua handler by build_profile.py.
+-- The short-lived verification ticket is /run/colorful-n14-control/permission.
+-- Shared Lua state is provided by the pinned upstream implementation.
+if not N14 then
+    N14 = { touched = false, ready = false }
+    local method = "\\_SB.AMW0.WMBA 0 2 b"
+    local digest = "4aab3c89fdaac8ab9e20d31cff3fe0a18b83877442520eb294429ff9237bef06"
+
+    local function read_file(path)
+        local f = io.open(path, "rb")
+        if not f then return nil end
+        local text = f:read("*a")
+        f:close()
+        return text
+    end
+
+    local function indexed(port, index, value)
+        local write = value ~= nil and 1 or 0
+        return "4259444c" .. string.format("%02x%02x", port % 256, math.floor(port / 256))
+            .. "000000000000" .. string.format("01%02x08%02x%02x", write, index, value or 0)
+            .. "00000000000000"
+    end
+
+    local function call(packet)
+        if #packet ~= 48 then return "N14: invalid packet length", 0 end
+        local e, v = acpi_call(method .. packet)
+        if e then return e, 0 end
+        if type(v) ~= "number" or v < 0 or v >= 2147483648 or v ~= math.floor(v) then
+            return "N14: firmware error or invalid response", 0
+        end
+        return nil, v
+    end
+
+    function N14.guard(writing)
+        if not N14.ready then
+            local dmi = "/sys/class/dmi/id/"
+            for name, expected in pairs({sys_vendor="COLORFUL", product_name="N14 24", bios_version="2.07"}) do
+                local actual = read_file(dmi .. name)
+                if not actual or actual:match("^%s*(.-)%s*$") ~= expected then
+                    return "N14: unsupported DMI/BIOS", 0
+                end
+            end
+            -- SMBIOS Type 0 offsets 0x16/0x17: EC firmware major/minor.
+            local smbios = read_file("/sys/firmware/dmi/entries/0-0/raw")
+            if not smbios or #smbios < 24 or smbios:byte(1) ~= 0
+                or smbios:byte(2) < 24 or smbios:byte(2) > #smbios
+                or smbios:byte(23) ~= 2 or smbios:byte(24) ~= 0 then
+                return "N14: SMBIOS EC firmware must be 2.0", 0
+            end
+            -- Created by prepare.py only after exact DSDT hash and WMI validation.
+            -- This is an accident-prevention guard, not a security boundary against root.
+            local ticket = read_file("/run/colorful-n14-control/permission")
+            if not ticket then return "N14: run prepare.py first (permission missing)", 0 end
+            local hash, high, low, access = ticket:match("^(%x+) (%x%x) (%x%x) (%a+)\n$")
+            if hash ~= digest or (access ~= "read" and access ~= "control") then
+                return "N14: invalid verification ticket", 0
+            end
+            high, low = tonumber(high, 16), tonumber(low, 16)
+            if high ~= 0x55 or low ~= 0x71 then
+                return "N14: only controller ID 55:71 is supported", 0
+            end
+            local e, actual_high = call(indexed(0x2e, 0x20, nil))
+            if e then return e, 0 end
+            local actual_low
+            e, actual_low = call(indexed(0x2e, 0x21, nil))
+            if e then return e, 0 end
+            if actual_high ~= high or actual_low ~= low then
+                return "N14: controller identification changed", 0
+            end
+            N14.control = access == "control"
+            N14.ready = true
+        end
+        if writing and not N14.control then
+            return "N14: diagnostic permission only; no fan writes allowed", 0
+        end
+        return nil, 0
+    end
+
+    local function field(index, value)
+        return call(indexed(0x302, index, value))
+    end
+
+    local function write_field(index, value)
+        local e, v = field(index, value)
+        if e then return e, 0 end
+        if v ~= 0 then return "N14: unexpected write response", 0 end
+        return nil, 0
+    end
+
+    -- Best effort: request BOTH fans at command 70 (100%); GPU RPM UNKNOWN.
+    -- Attempt all three operations even if one fails. Not hardware fail-safe.
+    local function request_full()
+        local first = nil
+        local e = write_field(0x50, 2)
+        if e then first = e end
+        e = write_field(0x54, 70)
+        if e and not first then first = e end
+        e = write_field(0x55, 70)
+        if e and not first then first = e end
+        return first, 0
+    end
+
+    function N14.read_cpu_tach()
+        local e = N14.guard(false)
+        if e then return e, 0 end
+        local v
+        e, v = field(0x5c, nil)
+        if e then return e, 0 end
+        -- Report the real value; do not synthesize RPM from the target.
+        -- >70 is outside the SDK-derived nominal scale and aborts this experiment.
+        if v > 70 then return "N14: tachometer outside unverified 0..7000 RPM range", 0 end
+        return nil, v
+    end
+
+    function N14.read_gpu_command()
+        local e = N14.guard(false)
+        if e then return e, 0 end
+        local v
+        e, v = field(0x55, nil)
+        if e then return e, 0 end
+        if v > 70 then return "N14: GPU command outside 0..70; RPM UNKNOWN", 0 end
+        -- Actual controller register read, not the last requested value or a tachometer.
+        -- Zero is reported honestly; command feedback cannot prove physical rotation.
+        return nil, v
+    end
+
+    function N14.write(index, value)
+        if index ~= 0x54 and index ~= 0x55 then return "N14: invalid target index", 0 end
+        if type(value) ~= "number" or value ~= math.floor(value) or value < 0 or value > 70 then
+            return "N14: invalid speed target", 0
+        end
+        local e = N14.guard(true)
+        if e then return e, 0 end
+        -- 40% nominal minimum: even a manual NBFC request of 0% cannot stop a fan.
+        value = math.max(28, value)
+        if not N14.touched then
+            -- Set before writing, so cleanup can attempt recovery after partial failure.
+            N14.touched = true
+            e = request_full()
+            if e then return e, 0 end
+        else
+            -- Reassert the same manual flag; never toggle through Normal.
+            e = write_field(0x50, 2)
+            if e then
+                request_full()
+                return e, 0
+            end
+        end
+        e = write_field(index, value)
+        if e then
+            request_full()
+            return e, 0
+        end
+        return nil, 0
+    end
+
+    function N14.reset()
+        -- Never write from cleanup if no control write has been attempted.
+        if not N14.touched then return nil, 0 end
+        -- Normal is reported broken; deliberately leave both fans requested full.
+        return request_full()
+    end
+end

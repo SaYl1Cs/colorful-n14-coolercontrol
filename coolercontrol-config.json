@@ -1,0 +1,33 @@
+{
+  "devices": [
+    {
+      "id": "colorful-n14-fans",
+      "label": "COLORFUL N14 24 — Both Fans",
+      "channels": [
+        {
+          "id": "both_fans",
+          "label": "Both Fans (0%=raw1 stopped; GPU RPM unavailable)",
+          "commands": {
+            "get_rpm": "/usr/local/libexec/colorful-n14-coolercontrol get-rpm",
+            "get_duty": "/usr/local/libexec/colorful-n14-coolercontrol get-duty",
+            "set_duty": "/usr/local/libexec/colorful-n14-coolercontrol set-duty '{duty}'",
+            "enable_manual": "/usr/local/libexec/colorful-n14-coolercontrol enable",
+            "reset": "/usr/local/libexec/colorful-n14-coolercontrol reset"
+          }
+        }
+      ],
+      "temps": [
+        {
+          "id": "cpu_temp",
+          "label": "CPU Temperature",
+          "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-cpu"
+        },
+        {
+          "id": "gpu_temp",
+          "label": "GPU Temperature",
+          "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-gpu"
+        }
+      ]
+    }
+  ]
+}
