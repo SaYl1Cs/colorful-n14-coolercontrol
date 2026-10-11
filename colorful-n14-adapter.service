@@ -1,0 +1,22 @@
+[Unit]
+Description=Persistent guarded Colorful N14 fan-control adapter
+Requires=colorful-n14-nbfc-prepare.service colorful-n14-sensors.service
+After=colorful-n14-nbfc-prepare.service colorful-n14-sensors.service
+Before=coolercontrold.service
+Conflicts=nbfc_service.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/python3 -B /usr/local/share/colorful-n14-control/adapter_server.py
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/colorful-n14-control
+
+[Install]
+WantedBy=multi-user.target

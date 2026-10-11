@@ -5,11 +5,19 @@ After=colorful-n14-nbfc-prepare.service nvidia-persistenced.service
 Before=coolercontrold.service
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/python3 /usr/local/share/colorful-n14-control/sensor_cache.py
-ExecStopPost=/usr/bin/rm -f /run/colorful-n14-control/cpu_temp /run/colorful-n14-control/gpu_temp
+Type=notify
+ExecStart=/usr/bin/python3 -B /usr/local/share/colorful-n14-control/sensor_cache.py
+ExecStopPost=/usr/bin/rm -f /run/colorful-n14-control/temperatures.json /run/colorful-n14-control/cpu_temp /run/colorful-n14-control/gpu_temp
 Restart=on-failure
 RestartSec=2
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/colorful-n14-control
+# N14_GPU_POLL=never is a strict no-NVML mode; see README for cooling trade-offs.
+Environment=N14_GPU_POLL=never
 
 [Install]
 WantedBy=multi-user.target

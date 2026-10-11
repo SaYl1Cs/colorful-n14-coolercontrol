@@ -24,7 +24,7 @@
         },
         {
           "id": "gpu_temp",
-          "label": "GPU Temperature",
+          "label": "GPU cooling input (CPU fallback while GPU sleeps)",
           "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-gpu"
         }
       ]

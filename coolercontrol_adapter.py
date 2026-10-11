@@ -13,9 +13,10 @@ import hashlib
 import os
 import re
 import sys
-import time
 from pathlib import Path
 from typing import NoReturn
+
+from thermal_state import read_cpu_snapshot, read_snapshot
 
 DMI = Path("/sys/class/dmi/id")
 EXPECTED_DMI = {
@@ -37,6 +38,7 @@ GPU_TARGET = 0x55
 CPU_TACH = 0x5C
 MIN_COMMAND = 1  # UI 0%: fans physically stop on this machine.
 MAX_RAW = 70     # UI 100%.
+_IDENTITY_CHECKED = False
 
 
 def fail(message: str) -> NoReturn:
@@ -65,8 +67,11 @@ def check_nbfc_stopped() -> None:
 
 
 def check_identity() -> None:
+    global _IDENTITY_CHECKED
     if os.geteuid() != 0:
         fail("must run as root")
+    if _IDENTITY_CHECKED:
+        return
     check_nbfc_stopped()
     for name, expected in EXPECTED_DMI.items():
         try:
@@ -89,6 +94,7 @@ def check_identity() -> None:
         fail("expected WMI interface is absent")
     if not PROC_CALL.exists():
         fail("acpi_call is not loaded")
+    _IDENTITY_CHECKED = True
 
 
 def packet(index: int, value: int | None = None) -> bytes:
@@ -175,6 +181,14 @@ def set_both(raw: int) -> None:
     if not MIN_COMMAND <= raw <= MAX_RAW:
         fail(f"fan command must be in {MIN_COMMAND}..{MAX_RAW}")
     guarded(require_control=True)
+    if raw < MAX_RAW:
+        # Never let a stale/failed sensor preserve a low fan command.
+        try:
+            temperatures = read_snapshot()
+            if temperatures['cpu_temp'] >= 90000 or temperatures['gpu_input'] >= 80000:
+                raw = MAX_RAW
+        except (OSError, ValueError, TypeError):
+            raw = MAX_RAW
     try:
         write_raw(MODE, 2)
         write_raw(CPU_TARGET, raw)
@@ -209,16 +223,12 @@ def read_duty() -> None:
 
 
 def read_cached_temp(sensor: str) -> None:
-    """Read a fresh temperature written by the persistent sensor service."""
-    path = Path("/run/colorful-n14-control") / f"{sensor}_temp"
+    """GPU channel is a labelled cooling input, not a fabricated sleep reading."""
     try:
-        value = int(path.read_text(encoding="ascii").strip())
-        age = max(0.0, time.time() - path.stat().st_mtime)
-    except (OSError, ValueError) as exc:
-        fail(f"{sensor} temperature cache is unavailable: {exc}")
-    if not 0 < value < 120000 or age > 5:
-        fail(f"{sensor} temperature cache is stale or invalid")
-    print(value)
+        data = read_cpu_snapshot() if sensor == "cpu" else read_snapshot()
+    except (OSError, ValueError, TypeError) as exc:
+        fail(f"temperature cache unavailable: {exc}")
+    print(data['cpu_temp' if sensor == 'cpu' else 'gpu_input'])
 
 
 def read_cpu_temp() -> None:
@@ -261,4 +271,7 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ['serve']:
+        from adapter_server import serve
+        raise SystemExit(serve())
     raise SystemExit(main(sys.argv))
