@@ -1,0 +1,2056 @@
+diff --git a/coolercontrold/daemon/resources/proto/coolercontrol/device_service/v1/fixed_duty.proto b/coolercontrold/daemon/resources/proto/coolercontrol/device_service/v1/fixed_duty.proto
+index f761eeb83e3954c2b48c776e75b0a95ec708587c..2d50581248b892e52875bf91083414d149a736d3 100644
+--- a/coolercontrold/daemon/resources/proto/coolercontrol/device_service/v1/fixed_duty.proto
++++ b/coolercontrold/daemon/resources/proto/coolercontrol/device_service/v1/fixed_duty.proto
+@@ -9,6 +9,8 @@ message FixedDutyRequest {
+   string device_id = 1;
+   string channel_id = 2;
+   int32 duty = 3;
++  // Immutable producer label; empty means no calculation provenance.
++  string provenance_json = 4;
+ }
+ 
+ message FixedDutyResponse {}
+diff --git a/coolercontrold/daemon/resources/proto/coolercontrol/models/v1/status.proto b/coolercontrold/daemon/resources/proto/coolercontrol/models/v1/status.proto
+index 676fe227118214d5db80bb558b051ebf035a89ff..f5c2c2b4e14826dd76cbde570bfc093248e1fb3d 100644
+--- a/coolercontrold/daemon/resources/proto/coolercontrol/models/v1/status.proto
++++ b/coolercontrold/daemon/resources/proto/coolercontrol/models/v1/status.proto
+@@ -8,6 +8,8 @@ package coolercontrol.models.v1;
+ message Status {
+   // The Channel/Temp ID
+   string id = 1;
++  // Original sensor sample metadata; never synthesized by a receiver.
++  string sample_provenance_json = 6;
+ 
+   oneof metric {
+     // Temperature in C
+diff --git a/coolercontrold/daemon/src/api/actor/device.rs b/coolercontrold/daemon/src/api/actor/device.rs
+index 8f4f2ca4a75e1ac6e55103e3a1efaeed3a1d401e..b9979ef135e86de72395f0d47c64b38f9a541ac0 100644
+--- a/coolercontrold/daemon/src/api/actor/device.rs
++++ b/coolercontrold/daemon/src/api/actor/device.rs
+@@ -1,8 +1,9 @@
+ // SPDX-FileCopyrightText: 2024 Guy Boldon, Eren Simsek and contributors
+ // SPDX-License-Identifier: GPL-3.0-or-later
+-use crate::api::actor::{run_api_actor, ApiActor};
+-use crate::api::devices::DeviceDto;
++use crate::AllDevices;
+ use crate::api::CCError;
++use crate::api::actor::{ApiActor, run_api_actor};
++use crate::api::devices::DeviceDto;
+ use crate::cc_fs;
+ use crate::config::Config;
+ use crate::device::{ChannelName, DeviceUID, Duty};
+@@ -14,7 +15,6 @@ use crate::repositories::gpu::amd_overdrive;
+ use crate::setting::{
+     LcdModeKind, LcdModeName, LcdSettings, LightingSettings, ProfileUID, Setting, SettingKind,
+ };
+-use crate::AllDevices;
+ use anyhow::Result;
+ use log::{error, info};
+ use mime::Mime;
+@@ -80,7 +80,7 @@ enum DeviceMessage {
+         device_uid: DeviceUID,
+         channel_name: ChannelName,
+         profile_uid: ProfileUID,
+-        respond_to: oneshot::Sender<Result<()>>,
++        respond_to: oneshot::Sender<Result<serde_json::Value>>,
+     },
+     DeviceSettingLCD {
+         device_uid: DeviceUID,
+@@ -288,13 +288,15 @@ impl ApiActor<DeviceMessage> for DeviceActor {
+                     self.engine
+                         .set_profile(&device_uid, &channel_name, &profile_uid)
+                         .await?;
++                    let assignment = self.engine.producer_assignment(&device_uid, &channel_name);
+                     let config_setting = Setting {
+                         channel_name,
+                         kind: SettingKind::Profile { profile_uid },
+                     };
+                     self.config.set_device_setting(&device_uid, &config_setting);
+                     self.modes_controller.clear_active_modes().await;
+-                    self.config.save_config_file().await
++                    self.config.save_config_file().await?;
++                    Ok(assignment)
+                 }
+                 .await;
+                 let _ = respond_to.send(result);
+@@ -621,7 +623,7 @@ impl DeviceHandle {
+         device_uid: DeviceUID,
+         channel_name: ChannelName,
+         profile_uid: ProfileUID,
+-    ) -> Result<()> {
++    ) -> Result<serde_json::Value> {
+         let (tx, rx) = oneshot::channel();
+         let msg = DeviceMessage::DeviceSettingProfile {
+             device_uid,
+diff --git a/coolercontrold/daemon/src/api/devices.rs b/coolercontrold/daemon/src/api/devices.rs
+index ed6080fa966c2c4a2136b828a831210073d42ebf..4e558c30b6e1a55e3f7aa5a01d948ad6917fb3a8 100644
+--- a/coolercontrold/daemon/src/api/devices.rs
++++ b/coolercontrold/daemon/src/api/devices.rs
+@@ -1,21 +1,21 @@
+ // SPDX-FileCopyrightText: 2023 Guy Boldon, Eren Simsek and contributors
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++use crate::Device;
+ use crate::api::actor::CalibrationHandle;
+-use crate::api::{handle_error, AppState, CCError};
+-use crate::calibration::{effective_speed_options, Calibration, ChannelKey};
++use crate::api::{AppState, CCError, handle_error};
++use crate::calibration::{Calibration, ChannelKey, effective_speed_options};
+ use crate::device::{ChannelName, DeviceInfo, DeviceType, DeviceUID, LcInfo, UID};
+ use crate::engine::processors::image;
+ use crate::setting::{LcdModeName, LcdSettings, LightingSettings, Setting};
+-use crate::Device;
+ use aide::axum::IntoApiResponse;
++use axum::Json;
+ use axum::extract::multipart::Field;
+ use axum::extract::{Multipart, Path, Query, State};
+ use axum::http::header;
+-use axum::Json;
+ use mime::Mime;
+ use schemars::JsonSchema;
+-use serde::{de, Deserialize, Deserializer, Serialize};
++use serde::{Deserialize, Deserializer, Serialize, de};
+ use std::collections::HashMap;
+ use std::fmt;
+ use std::ops::Not;
+@@ -116,7 +116,7 @@ pub async fn device_setting_profile_modify(
+         ..
+     }): State<AppState>,
+     Json(profile_uid_json): Json<SettingProfileUID>,
+-) -> Result<(), CCError> {
++) -> Result<Json<serde_json::Value>, CCError> {
+     reject_when_calibrating(&calibration_handle, &path).await?;
+     device_handle
+         .device_setting_profile(
+@@ -125,6 +125,7 @@ pub async fn device_setting_profile_modify(
+             profile_uid_json.profile_uid,
+         )
+         .await
++        .map(Json)
+         .map_err(handle_error)
+ }
+ 
+@@ -678,9 +679,11 @@ mod tests {
+             .await
+             .unwrap_err();
+ 
+-        assert!(error
+-            .to_string()
+-            .contains("Only one image is supported at this time"));
++        assert!(
++            error
++                .to_string()
++                .contains("Only one image is supported at this time")
++        );
+     }
+ 
+     #[tokio::test]
+@@ -737,10 +740,11 @@ mod tests {
+             .await
+             .unwrap();
+ 
+-        assert!(form
+-            .lcd_mode()
+-            .unwrap_err()
+-            .to_string()
+-            .contains("Invalid LCD mode name: hologram"));
++        assert!(
++            form.lcd_mode()
++                .unwrap_err()
++                .to_string()
++                .contains("Invalid LCD mode name: hologram")
++        );
+     }
+ }
+diff --git a/coolercontrold/daemon/src/calibration/dispatch.rs b/coolercontrold/daemon/src/calibration/dispatch.rs
+index 058ebbffe00596d1acc38a41e54029c5a89301a5..171655bba9b8394cc6acb25d072a572f00b99807 100644
+--- a/coolercontrold/daemon/src/calibration/dispatch.rs
++++ b/coolercontrold/daemon/src/calibration/dispatch.rs
+@@ -24,10 +24,10 @@
+ // pedantic similar_names would hurt readability.
+ #![allow(clippy::similar_names)]
+ 
++use super::ChannelKey;
+ use super::curve::{Calibration, MappedDuty};
+ use super::state::{ChannelEntry, FanState, FanStateMap};
+ use super::store::CalibrationStore;
+-use super::ChannelKey;
+ use crate::device::{ChannelName, DeviceUID, Duty, UID};
+ use crate::repositories::repository::Repository;
+ use crate::rt;
+@@ -58,6 +58,16 @@ const _: () = assert!((MAX_WALK_STEPS as usize) * (WALK_STEP_DUTY as usize) > 10
+ /// Tests implement this trait directly to capture the sequence of writes.
+ #[async_trait(?Send)]
+ pub trait DutyWriter {
++    async fn write_device_duty_provenance(
++        &self,
++        device_uid: &UID,
++        channel_name: &str,
++        device_duty: Duty,
++        _provenance: &str,
++    ) -> Result<()> {
++        self.write_device_duty(device_uid, channel_name, device_duty)
++            .await
++    }
+     async fn write_device_duty(
+         &self,
+         device_uid: &UID,
+@@ -89,6 +99,17 @@ impl RepoWriter {
+ 
+ #[async_trait(?Send)]
+ impl DutyWriter for RepoWriter {
++    async fn write_device_duty_provenance(
++        &self,
++        device_uid: &UID,
++        channel_name: &str,
++        device_duty: Duty,
++        provenance: &str,
++    ) -> Result<()> {
++        self.repo
++            .apply_setting_speed_fixed_provenance(device_uid, channel_name, device_duty, provenance)
++            .await
++    }
+     async fn write_device_duty(
+         &self,
+         device_uid: &UID,
+diff --git a/coolercontrold/daemon/src/device.rs b/coolercontrold/daemon/src/device.rs
+index e48f72d51cb239d3544ddbf723e0afc0ccfafd79..f3d2d3bad758bc6bff5dbc6981e00016afd0952d 100644
+--- a/coolercontrold/daemon/src/device.rs
++++ b/coolercontrold/daemon/src/device.rs
+@@ -164,6 +164,12 @@ pub struct Device {
+     /// A double-sided Vector of statuses wrapped in Arc for efficient sharing
+     pub status_history: Arc<VecDeque<Status>>,
+ 
++    /// Sidecar sample identities aligned with exact plugin status timestamps.
++    /// Not serialized into public device/history APIs or cloned into synthetic history.
++    #[serde(skip)]
++    #[schemars(skip)]
++    pub source_samples: VecDeque<(DateTime<Local>, HashMap<String, String>)>,
++
+     /// Specific Liquidctl device information
+     pub lc_info: Option<LcInfo>,
+ 
+@@ -230,6 +236,7 @@ impl Device {
+             uid,
+             device_id,
+             status_history,
++            source_samples: VecDeque::new(),
+             lc_info,
+             info,
+             status_augmenter: None,
+diff --git a/coolercontrold/daemon/src/engine/commanders/graph.rs b/coolercontrold/daemon/src/engine/commanders/graph.rs
+index 773c9141c07989c790620533aaa89e37eff846db..113723a2e1bc61ba0c832cd92e01f992062a9abd 100644
+--- a/coolercontrold/daemon/src/engine/commanders/graph.rs
++++ b/coolercontrold/daemon/src/engine/commanders/graph.rs
+@@ -6,21 +6,21 @@ use std::collections::{HashMap, HashSet};
+ use std::ops::Not;
+ use std::rc::Rc;
+ 
+-use crate::calibration::{self, effective_speed_options, CalibrationStore, FanStateMap};
++use crate::AllDevices;
++use crate::calibration::{self, CalibrationStore, FanStateMap, effective_speed_options};
+ use crate::config::Config;
+ use crate::device::{ChannelName, DeviceUID, Duty, UID};
+ use crate::engine::main::DutyWritersByType;
+ use crate::engine::processors::functions::{
+-    calc_ideal_stack_size, FunctionDutyThresholdPostProcessor, FunctionIdentityPreProcessor,
+-    FunctionSafetyLatchProcessor, FunctionStandardPostProcessor, FunctionStandardPreProcessor,
++    FunctionDutyThresholdPostProcessor, FunctionIdentityPreProcessor, FunctionSafetyLatchProcessor,
++    FunctionStandardPostProcessor, FunctionStandardPreProcessor, calc_ideal_stack_size,
+ };
+ use crate::engine::processors::profiles::GraphProcessor;
+ use crate::engine::{
+-    utils, DeviceChannelProfileSetting, NormalizedGraphProfile, Processor, SpeedProfileData,
++    DeviceChannelProfileSetting, NormalizedGraphProfile, Processor, SpeedProfileData, utils,
+ };
+ use crate::setting::{Function, FunctionUID, Profile, ProfileType, ProfileUID};
+-use crate::AllDevices;
+-use anyhow::{anyhow, Context, Result};
++use anyhow::{Context, Result, anyhow};
+ use log::{debug, info, warn};
+ use moro_local::Scope;
+ 
+@@ -77,6 +77,8 @@ struct ProcessorCollection {
+ /// For ex. Fan and Pump controls based on CPU Temp,
+ /// or profile speed settings for devices that only support fixed speeds.
+ pub struct GraphProfileCommander {
++    pub producer: crate::engine::provenance::Producer,
++    pub calculations: RefCell<HashMap<ProfileUID, serde_json::Value>>,
+     all_devices: AllDevices,
+     duty_writers_by_type: DutyWritersByType,
+     scheduled_settings:
+@@ -100,6 +102,8 @@ impl GraphProfileCommander {
+         fan_state_map: Rc<FanStateMap>,
+     ) -> Self {
+         Self {
++            producer: crate::engine::provenance::Producer::new(),
++            calculations: RefCell::new(HashMap::new()),
+             duty_writers_by_type,
+             scheduled_settings: RefCell::new(HashMap::new()),
+             config,
+@@ -139,6 +143,14 @@ impl GraphProfileCommander {
+             device_channel.channel_name(),
+             profile,
+         )?;
++        self.calculations.borrow_mut().remove(&profile.uid);
++        if matches!(device_channel, DeviceChannelProfileSetting::Graph { .. }) {
++            self.producer.bind(
++                device_channel.device_uid(),
++                device_channel.channel_name(),
++                &profile.uid,
++            );
++        }
+         let mut settings_lock = self.scheduled_settings.borrow_mut();
+         if let Some(mut existing_device_channels) =
+             settings_lock.remove(&normalized_profile_setting)
+@@ -170,6 +182,7 @@ impl GraphProfileCommander {
+     }
+ 
+     pub fn clear_channel_setting(&self, device_uid: &DeviceUID, channel_name: &str) {
++        self.producer.clear(device_uid, channel_name);
+         // the mix commander will have multiple profiles for the same channel, so we need a Vec:
+         let mut profiles_to_remove = HashSet::new();
+         let device_channel_setting = DeviceChannelProfileSetting::Graph {
+@@ -206,7 +219,16 @@ impl GraphProfileCommander {
+     pub fn process_all_profiles(&self) {
+         let mut output_cache_lock = self.process_output_cache.borrow_mut();
+         for normalized_profile in self.scheduled_settings.borrow().keys() {
++            // Synchronous snapshot: no await between observation and calculation.
++            let observations = self.source_observations(normalized_profile);
+             let optional_duty_to_set = self.process_speed_setting(normalized_profile);
++            if let Some(duty) = optional_duty_to_set {
++                self.calculations.borrow_mut().insert(
++                    normalized_profile.profile_uid.clone(),
++                    self.producer
++                        .calculation(&normalized_profile.profile_uid, duty, observations),
++                );
++            }
+             if let Some(cache) = output_cache_lock.get_mut(&normalized_profile.profile_uid) {
+                 *cache = optional_duty_to_set;
+             }
+@@ -217,9 +239,16 @@ impl GraphProfileCommander {
+     /// Normally triggered by a loop/timer.
+     pub fn update_speeds<'s>(&'s self, scope: &'s Scope<'s, 's, Result<()>>) {
+         for (device_uid, channel_duties_to_set) in self.collect_processed_outputs() {
++            let commands: Vec<_> = channel_duties_to_set
++                .into_iter()
++                .map(|(channel, duty)| {
++                    let label = self.calculation_label(&device_uid, &channel);
++                    (channel, duty, label)
++                })
++                .collect();
+             scope.spawn(async move {
+-                for (channel_name, duty_to_set) in channel_duties_to_set {
+-                    self.set_device_speed(&device_uid, &channel_name, duty_to_set)
++                for (channel_name, duty_to_set, label) in commands {
++                    self.set_device_speed_labeled(&device_uid, &channel_name, duty_to_set, label)
+                         .await;
+                 }
+             });
+@@ -257,6 +286,43 @@ impl GraphProfileCommander {
+         output_to_apply
+     }
+ 
++    pub fn calculation_label(&self, device: &str, channel: &str) -> Option<String> {
++        let profile = self.producer.profile(device, channel)?;
++        self.producer
++            .label(device, channel, self.calculations.borrow().get(&profile)?)
++    }
++
++    fn source_observations(&self, profile: &NormalizedGraphProfile) -> serde_json::Value {
++        let statuses = self.all_devices.get(&profile.temp_source.device_uid).map(|device| {
++            let device = device.borrow();
++            device.status_history.iter().rev().take(profile.ideal_stack_size.max(1))
++                .map(|status| serde_json::json!({
++                    "status_unix_ms": status.timestamp.timestamp_millis(),
++                    "sensor_sample": device.source_samples.iter().rev()
++                        .find(|(time, _)| *time == status.timestamp)
++                        .and_then(|(_, samples)| samples.get(&profile.temp_source.temp_name))
++                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
++                    "temperature": status.temps.iter().find(|t| t.name == profile.temp_source.temp_name).map(|t| t.temp)
++                })).collect::<Vec<_>>()
++        }).unwrap_or_default();
++        // Compatibility with the consumer's graph-level sample field. Only the
++        // newest observation may supply it: never search older history after a
++        // failed read, and never manufacture a timestamp or sample identity.
++        let sensor_sample = statuses
++            .first()
++            .filter(|status| status["temperature"].as_f64().is_some_and(f64::is_finite))
++            .and_then(|status| status.get("sensor_sample"))
++            .filter(|sample| sample.is_object())
++            .cloned()
++            .unwrap_or(serde_json::Value::Null);
++        serde_json::json!({"kind": "graph", "source_device_uid": profile.temp_source.device_uid,
++            "source_temp_name": profile.temp_source.temp_name, "function_uid": profile.function.uid,
++            "sensor_sample": sensor_sample,
++            "status_observations_newest_first": statuses,
++            "freshness_scope": "daemon_status_not_sensor_sample",
++            "stateful_function": true})
++    }
++
+     fn process_speed_setting(
+         &self,
+         normalized_profile: &Rc<NormalizedGraphProfile>,
+@@ -288,6 +354,18 @@ impl GraphProfileCommander {
+     /// pre-built `duty_writers_by_type` cache so the hot path has no clones or
+     /// allocations.
+     pub async fn set_device_speed(&self, device_uid: &UID, channel_name: &str, duty_to_set: u8) {
++        // Overlay/manual callers have no supported producer contract: do not invent one.
++        self.set_device_speed_labeled(device_uid, channel_name, duty_to_set, None)
++            .await;
++    }
++
++    pub async fn set_device_speed_labeled(
++        &self,
++        device_uid: &UID,
++        channel_name: &str,
++        duty_to_set: u8,
++        label: Option<String>,
++    ) {
+         let (device_type, device_name) = {
+             // this will block if reference is held, thus clone()
+             let device_lock = self.all_devices[device_uid].borrow();
+@@ -300,6 +378,26 @@ impl GraphProfileCommander {
+         let Some(writer) = self.duty_writers_by_type.get(&device_type) else {
+             return;
+         };
++        // Calibration's deferred kick reads a mutable target from shared fan state.
++        // Until that state carries the target's own label, do not claim provenance.
++        // A provenance-required plugin rejects the resulting unlabelled command.
++        let label = if self
++            .calibration_store
++            .get(&(device_uid.clone(), channel_name.to_owned()))
++            .is_some()
++        {
++            None
++        } else {
++            label
++        };
++        let labeled_writer;
++        let writer = if let Some(label) = label {
++            labeled_writer =
++                crate::engine::provenance::LabeledWriter::bind(Rc::clone(writer), label);
++            &labeled_writer
++        } else {
++            writer
++        };
+         let write_result = calibration::dispatch(
+             &self.fan_state_map,
+             &self.calibration_store,
+@@ -427,9 +525,11 @@ mod tests {
+         let mut write_failure_log = WriteFailureLog::default();
+         assert!(write_failure_log.record_failure(&DEVICE.to_string(), FAN));
+         for _ in 0..1_000 {
+-            assert!(write_failure_log
+-                .record_failure(&DEVICE.to_string(), FAN)
+-                .not());
++            assert!(
++                write_failure_log
++                    .record_failure(&DEVICE.to_string(), FAN)
++                    .not()
++            );
+         }
+         assert!(write_failure_log.record_success(&DEVICE.to_string(), FAN));
+         // A new run after a recovery is a new episode and logs again.
+@@ -468,16 +568,22 @@ mod tests {
+         // failing, and that must report no recovery.
+         // Method: successes against an empty log, and against a device that never failed.
+         let mut write_failure_log = WriteFailureLog::default();
+-        assert!(write_failure_log
+-            .record_success(&DEVICE.to_string(), FAN)
+-            .not());
++        assert!(
++            write_failure_log
++                .record_success(&DEVICE.to_string(), FAN)
++                .not()
++        );
+         write_failure_log.record_failure(&OTHER_DEVICE.to_string(), PUMP);
+-        assert!(write_failure_log
+-            .record_success(&DEVICE.to_string(), FAN)
+-            .not());
+-        assert!(write_failure_log
+-            .record_success(&OTHER_DEVICE.to_string(), FAN)
+-            .not());
++        assert!(
++            write_failure_log
++                .record_success(&DEVICE.to_string(), FAN)
++                .not()
++        );
++        assert!(
++            write_failure_log
++                .record_success(&OTHER_DEVICE.to_string(), FAN)
++                .not()
++        );
+     }
+ 
+     #[test]
+diff --git a/coolercontrold/daemon/src/engine/commanders/mix.rs b/coolercontrold/daemon/src/engine/commanders/mix.rs
+index 1eb1559f622e1e74bf182499e02d857f1853a0f6..a7eeb2fcebe7d59e05226108a925d41a40e35e6e 100644
+--- a/coolercontrold/daemon/src/engine/commanders/mix.rs
++++ b/coolercontrold/daemon/src/engine/commanders/mix.rs
+@@ -7,15 +7,15 @@ use std::hash::{Hash, Hasher};
+ use std::ops::{Div, Not, Sub};
+ use std::rc::Rc;
+ 
+-use anyhow::{anyhow, Result};
++use anyhow::{Result, anyhow};
+ use log::error;
+ use moro_local::Scope;
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::device::{ChannelName, DeviceUID, Duty, UID};
+-use crate::engine::commanders::graph::GraphProfileCommander;
+-use crate::engine::commanders::OutputDedupState;
+ use crate::engine::DeviceChannelProfileSetting;
++use crate::engine::commanders::OutputDedupState;
++use crate::engine::commanders::graph::GraphProfileCommander;
+ use crate::setting::{Profile, ProfileMixFunctionType, ProfileType, ProfileUID};
+ 
+ type MixProfile = Profile;
+@@ -67,6 +67,17 @@ impl MixProfileCommander {
+         }
+         let normalized_mix_setting = Self::normalize_mix_setting(mix_profile, &member_profiles);
+         self.schedule_member_profiles(&device_channel, member_profiles, member_sub_profiles)?;
++        self.graph_commander
++            .calculations
++            .borrow_mut()
++            .remove(&mix_profile.uid);
++        if matches!(device_channel, DeviceChannelProfileSetting::Mix { .. }) {
++            self.graph_commander.producer.bind(
++                device_channel.device_uid(),
++                device_channel.channel_name(),
++                &mix_profile.uid,
++            );
++        }
+         let mut settings_lock = self.scheduled_settings.borrow_mut();
+         if let Some(mut existing_device_channels) = settings_lock.remove(&normalized_mix_setting) {
+             // We replace the existing NormalizedMixProfile if it exists to make sure it's
+@@ -221,6 +232,7 @@ impl MixProfileCommander {
+                 &HashMap::new(), // No mix outputs needed for children
+                 &last_applied_duties,
+             );
++            self.record_calculation(mix_profile, result, &graph_duties, &HashMap::new());
+             pass1_results.insert(mix_profile.profile_uid.clone(), result);
+         }
+ 
+@@ -248,6 +260,7 @@ impl MixProfileCommander {
+                 &mix_duties,
+                 &last_applied_duties,
+             );
++            self.record_calculation(mix_profile, result, &graph_duties, &mix_duties);
+             pass2_results.insert(mix_profile.profile_uid.clone(), result);
+         }
+         drop(mix_duties);
+@@ -261,6 +274,35 @@ impl MixProfileCommander {
+         }
+     }
+ 
++    /// Copy member calculation identities, including retained outputs. A member with
++    /// no known calculation stays null; never stamp it with the current tick.
++    fn record_calculation(
++        &self,
++        profile: &NormalizedMixProfile,
++        result: Option<Duty>,
++        graph: &HashMap<ProfileUID, Option<Duty>>,
++        mix: &HashMap<ProfileUID, Option<Duty>>,
++    ) {
++        let Some(duty) = result else {
++            return;
++        };
++        let mut calculations = self.graph_commander.calculations.borrow_mut();
++        let members: Vec<_> = profile.member_profile_uids.iter().map(|uid| {
++            if let Some(fixed) = profile.member_fixed_profile_duties.get(uid) {
++                return serde_json::json!({"profile_uid": uid, "kind": "fixed", "duty": fixed});
++            }
++            let output = if profile.member_mix_profile_uids.contains(uid) { mix.get(uid) } else { graph.get(uid) };
++            serde_json::json!({"profile_uid": uid, "kind": "calculated",
++                "retained": output.is_none_or(Option::is_none), "calculation": calculations.get(uid)})
++        }).collect();
++        let calculation = self.graph_commander.producer.calculation(
++            &profile.profile_uid,
++            duty,
++            serde_json::json!({"kind": "mix", "members": members}),
++        );
++        calculations.insert(profile.profile_uid.clone(), calculation);
++    }
++
+     /// Processes a single Mix profile and returns the calculated duty.
+     fn process_single_mix_profile(
+         mix_profile: &NormalizedMixProfile,
+@@ -328,10 +370,19 @@ impl MixProfileCommander {
+     /// Normally triggered by a loop/timer.
+     pub fn update_speeds<'s>(&'s self, scope: &'s Scope<'s, 's, Result<()>>) {
+         for (device_uid, channel_duties_to_apply) in self.collect_duties_to_apply() {
++            let commands: Vec<_> = channel_duties_to_apply
++                .into_iter()
++                .map(|(channel, duty)| {
++                    let label = self
++                        .graph_commander
++                        .calculation_label(&device_uid, &channel);
++                    (channel, duty, label)
++                })
++                .collect();
+             scope.spawn(async move {
+-                for (channel_name, duty) in channel_duties_to_apply {
++                for (channel_name, duty, label) in commands {
+                     self.graph_commander
+-                        .set_device_speed(&device_uid, &channel_name, duty)
++                        .set_device_speed_labeled(&device_uid, &channel_name, duty, label)
+                         .await;
+                 }
+             });
+@@ -384,11 +435,7 @@ impl MixProfileCommander {
+                         let apply = dedup_lock
+                             .get_mut(uid)
+                             .is_none_or(|state| state.should_apply(*duty));
+-                        if apply {
+-                            Some(*duty)
+-                        } else {
+-                            None
+-                        }
++                        if apply { Some(*duty) } else { None }
+                     }
+                     None => None,
+                 };
+@@ -552,11 +599,11 @@ impl Hash for NormalizedMixProfile {
+ 
+ #[cfg(test)]
+ mod tests {
++    use crate::engine::DeviceChannelProfileSetting;
++    use crate::engine::commanders::DEFAULT_SAFETY_LATCH_COUNT;
+     use crate::engine::commanders::mix::{
+         MixProfileCommander, NormalizedMixProfile, OutputDedupState,
+     };
+-    use crate::engine::commanders::DEFAULT_SAFETY_LATCH_COUNT;
+-    use crate::engine::DeviceChannelProfileSetting;
+     use crate::setting::ProfileMixFunctionType;
+     use std::collections::{HashMap, HashSet};
+     use std::ops::Not;
+@@ -1193,7 +1240,7 @@ mod tests {
+     fn dedup_safety_latch_reapplies() {
+         let mut state = OutputDedupState::new();
+         assert!(state.should_apply(50)); // tick 0: first apply, counter resets to 0
+-                                         // Ticks 1..=30: all suppressed (counter goes 0->1, 1->2, ..., 29->30)
++        // Ticks 1..=30: all suppressed (counter goes 0->1, 1->2, ..., 29->30)
+         for _ in 0..DEFAULT_SAFETY_LATCH_COUNT {
+             assert!(state.should_apply(50).not());
+         }
+diff --git a/coolercontrold/daemon/src/engine/main.rs b/coolercontrold/daemon/src/engine/main.rs
+index 3c2cba34d86da45ad8abe9bbb526a1603d52e0b6..608686ada1bcb91d3e387c4716dfd171e9e3ed0e 100644
+--- a/coolercontrold/daemon/src/engine/main.rs
++++ b/coolercontrold/daemon/src/engine/main.rs
+@@ -9,37 +9,37 @@ use std::rc::Rc;
+ use std::sync::Arc;
+ use std::time::Duration as StdDuration;
+ 
+-use crate::api::actor::{CalibrationBatchEntry, CalibrationBatchStatus, CalibrationStatus};
+ use crate::api::CCError;
++use crate::api::actor::{CalibrationBatchEntry, CalibrationBatchStatus, CalibrationStatus};
+ use crate::calibration::{
+-    self, others_over_limit_note, BatchBeginError, BatchEntry, BatchEntryPhase, Calibration,
++    self, BatchBeginError, BatchEntry, BatchEntryPhase, CALIBRATION_TEMP_HINT, Calibration,
+     CalibrationAlertGate, CalibrationBatchState, CalibrationEntry, CalibrationStore, ChannelKey,
+     DiagnosisFailure, DiagnosisHost, DiagnosisProgress, DiagnosisRegistry, DiagnosisSettings,
+-    FanStateMap, HottestTemp, RepoWriter, SettingsSnapshot, SnapshotKind, CALIBRATION_TEMP_HINT,
++    FanStateMap, HottestTemp, RepoWriter, SettingsSnapshot, SnapshotKind, others_over_limit_note,
+ };
+ use crate::config::Config;
+ use crate::device::{
+     ChannelExtensionNames, ChannelInfo, ChannelName, ChannelStatus, DeviceType, DeviceUID, Duty,
+-    Status, TempStatus, RPM, UID,
++    RPM, Status, TempStatus, UID,
+ };
+ use crate::engine::commanders::graph::GraphProfileCommander;
+-use crate::engine::commanders::lcd::{LcdCommander, DEFAULT_LCD_SHUTDOWN_IMAGE};
++use crate::engine::commanders::lcd::{DEFAULT_LCD_SHUTDOWN_IMAGE, LcdCommander};
+ use crate::engine::commanders::mix::MixProfileCommander;
+ use crate::engine::commanders::overlay::OverlayProfileCommander;
+-use crate::engine::{processors, DeviceChannelProfileSetting};
++use crate::engine::{DeviceChannelProfileSetting, processors};
+ use crate::notifier::{self, NotificationHandle, NotificationIcon};
+ use crate::overrides::OverridesController;
+ use crate::paths;
+ use crate::repositories::repository::{DeviceLock, Repository};
+ use crate::rt;
+ use crate::setting::{
+-    ChannelExtensions, FunctionUID, LcdModeKind, LcdModeName, LcdSettings, LightingSettings,
+-    Profile, ProfileType, ProfileUID, Setting, SettingKind, TempSource, DEFAULT_FUNCTION_UID,
++    ChannelExtensions, DEFAULT_FUNCTION_UID, FunctionUID, LcdModeKind, LcdModeName, LcdSettings,
++    LightingSettings, Profile, ProfileType, ProfileUID, Setting, SettingKind, TempSource,
+ };
+-use crate::{cc_fs, repositories, AllDevices, Repos};
+-use anyhow::{anyhow, Context, Result};
++use crate::{AllDevices, Repos, cc_fs, repositories};
++use anyhow::{Context, Result, anyhow};
+ use chrono::Local;
+-use log::{debug, error, info, log, trace, warn, Level};
++use log::{Level, debug, error, info, log, trace, warn};
+ use mime::Mime;
+ use moro_local::Scope;
+ use std::time::Instant;
+@@ -86,6 +86,15 @@ pub struct Engine {
+ }
+ 
+ impl Engine {
++    /// Captured by the profile PUT actor before it yields to persistence.
++    /// Null denotes a profile path without producer provenance support.
++    pub fn producer_assignment(&self, device: &str, channel: &str) -> serde_json::Value {
++        self.graph_commander
++            .producer
++            .assignment(device, channel)
++            .unwrap_or(serde_json::Value::Null)
++    }
++
+     pub fn new(
+         all_devices: AllDevices,
+         repos: &Repos,
+diff --git a/coolercontrold/daemon/src/engine/mod.rs b/coolercontrold/daemon/src/engine/mod.rs
+index 1f9f5b0109ec4e96a1e787103bed1ed37c9065d5..c803b6750385ece6a99a3b9aa60e4aea476643a2 100644
+--- a/coolercontrold/daemon/src/engine/mod.rs
++++ b/coolercontrold/daemon/src/engine/mod.rs
+@@ -12,6 +12,7 @@ use crate::setting::{Function, ProfileUID, TempSource};
+ mod commanders;
+ pub mod main;
+ pub mod processors;
++pub mod provenance;
+ mod tests;
+ pub mod utils;
+ 
+diff --git a/coolercontrold/daemon/src/engine/provenance.rs b/coolercontrold/daemon/src/engine/provenance.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f812ac9af2700b22231f84c0405d782d3ef2b10b
+--- /dev/null
++++ b/coolercontrold/daemon/src/engine/provenance.rs
+@@ -0,0 +1,339 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++//! Immutable calculation labels for software Graph and Mix commands.
++//!
++//! The counter orders assignments and calculations even within one clock tick.
++//! Wall-clock timestamps are observations, not a freshness policy. In particular,
++//! retained Mix members and sensor metadata must never be re-stamped here.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::rc::Rc;
++
++use anyhow::Result;
++use async_trait::async_trait;
++use chrono::Utc;
++use serde::Serialize;
++use serde_json::{Value, json};
++use uuid::Uuid;
++
++use crate::calibration::DutyWriter;
++use crate::device::{Duty, UID};
++
++#[derive(Clone, Serialize)]
++struct Assignment {
++    generation: u64,
++    profile_uid: String,
++    assigned_at_unix_ms: i64,
++}
++
++/// One producer session per engine instance. Never clone or restore its counter.
++/// This is main-thread state, just like the commanders that own it.
++pub struct Producer {
++    session: String,
++    counter: Cell<u64>,
++    assignments: RefCell<HashMap<(String, String), Assignment>>,
++}
++
++impl Producer {
++    pub fn new() -> Self {
++        Self {
++            session: Uuid::new_v4().to_string(),
++            counter: Cell::new(0),
++            assignments: RefCell::new(HashMap::new()),
++        }
++    }
++
++    fn next_id(&self) -> u64 {
++        // Exhaustion must stop production, never wrap and reuse an identity.
++        let next = self
++            .counter
++            .get()
++            .checked_add(1)
++            .expect("producer identity counter exhausted");
++        self.counter.set(next);
++        next
++    }
++
++    pub fn bind(&self, device: &str, channel: &str, profile: &str) {
++        let assignment = Assignment {
++            generation: self.next_id(),
++            profile_uid: profile.to_owned(),
++            assigned_at_unix_ms: Utc::now().timestamp_millis(),
++        };
++        self.assignments
++            .borrow_mut()
++            .insert((device.to_owned(), channel.to_owned()), assignment);
++    }
++
++    pub fn clear(&self, device: &str, channel: &str) {
++        self.assignments
++            .borrow_mut()
++            .remove(&(device.to_owned(), channel.to_owned()));
++    }
++
++    pub fn profile(&self, device: &str, channel: &str) -> Option<String> {
++        self.assignments
++            .borrow()
++            .get(&(device.to_owned(), channel.to_owned()))
++            .map(|assignment| assignment.profile_uid.clone())
++    }
++
++    pub fn assignment(&self, device: &str, channel: &str) -> Option<Value> {
++        let assignments = self.assignments.borrow();
++        let assignment = assignments.get(&(device.to_owned(), channel.to_owned()))?;
++        Some(json!({
++            "schema": 1,
++            "producer_session": self.session,
++            "device_uid": device,
++            "channel_name": channel,
++            "assignment": assignment,
++        }))
++    }
++
++    pub fn calculation(&self, profile: &str, duty: Duty, inputs: Value) -> Value {
++        json!({
++            "calculation_id": self.next_id(),
++            "calculated_at_unix_ms": Utc::now().timestamp_millis(),
++            "profile_uid": profile,
++            "duty": duty,
++            "inputs": inputs,
++        })
++    }
++
++    /// Serialize before queueing. Never attach a calculation that predates the
++    /// current assignment, even if its profile and millisecond timestamp match.
++    pub fn label(&self, device: &str, channel: &str, calculation: &Value) -> Option<String> {
++        let mut envelope = self.assignment(device, channel)?;
++        let assignment = &envelope["assignment"];
++        let id = calculation["calculation_id"].as_u64()?;
++        if calculation["profile_uid"] != assignment["profile_uid"]
++            || id <= assignment["generation"].as_u64()?
++            || id > self.counter.get()
++            || calculation["calculated_at_unix_ms"].as_i64()?
++                < assignment["assigned_at_unix_ms"].as_i64()?
++            || calculation["duty"].as_u64()? > 100
++            || !calculation["inputs"].is_object()
++        {
++            return None;
++        }
++        envelope["calculation"] = calculation.clone();
++        Some(envelope.to_string())
++    }
++}
++
++/// A queued write owns its original bytes. There is deliberately no reference
++/// to the producer or its mutable assignment map at the dispatch boundary.
++pub struct LabeledWriter {
++    inner: Rc<dyn DutyWriter>,
++    label: String,
++}
++
++impl LabeledWriter {
++    pub fn bind(inner: Rc<dyn DutyWriter>, label: String) -> Rc<dyn DutyWriter> {
++        Rc::new(Self { inner, label })
++    }
++}
++
++#[async_trait(?Send)]
++impl DutyWriter for LabeledWriter {
++    async fn write_device_duty(
++        &self,
++        device_uid: &UID,
++        channel_name: &str,
++        device_duty: Duty,
++    ) -> Result<()> {
++        self.inner
++            .write_device_duty_provenance(device_uid, channel_name, device_duty, &self.label)
++            .await
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn producer_sessions_and_assignment_envelopes() {
++        let producer = Producer::new();
++        let other = Producer::new();
++        assert_ne!(producer.session, other.session);
++        assert_eq!(
++            Uuid::parse_str(&producer.session)
++                .unwrap()
++                .get_version_num(),
++            4
++        );
++        assert!(producer.assignment("device", "fan").is_none());
++        let before = Utc::now().timestamp_millis();
++        producer.bind("device", "fan", "graph");
++        let envelope = producer.assignment("device", "fan").unwrap();
++        assert_eq!(envelope["schema"], 1);
++        assert_eq!(envelope["producer_session"], producer.session);
++        assert_eq!(envelope["device_uid"], "device");
++        assert_eq!(envelope["channel_name"], "fan");
++        assert_eq!(envelope["assignment"]["profile_uid"], "graph");
++        assert_eq!(envelope["assignment"]["generation"], 1);
++        assert!(
++            envelope["assignment"]["assigned_at_unix_ms"]
++                .as_i64()
++                .unwrap()
++                >= before
++        );
++        assert!(envelope.get("calculation").is_none());
++    }
++
++    #[test]
++    fn producer_reassignment_rejects_old_calculations_without_relabeling_queued_bytes() {
++        let producer = Producer::new();
++        producer.bind("device", "fan", "graph");
++        let old_assignment = producer.assignment("device", "fan").unwrap();
++        let old = producer.calculation("graph", 42, json!({"kind": "graph"}));
++        let queued = producer.label("device", "fan", &old).unwrap();
++        producer.bind("device", "fan", "graph");
++        assert!(producer.label("device", "fan", &old).is_none());
++        let new = producer.calculation("graph", 43, json!({"kind": "graph"}));
++        let new_label: Value =
++            serde_json::from_str(&producer.label("device", "fan", &new).unwrap()).unwrap();
++        let old_label: Value = serde_json::from_str(&queued).unwrap();
++        assert_eq!(old_label["assignment"], old_assignment["assignment"]);
++        assert_eq!(old_label["calculation"], old);
++        assert_eq!(old["calculation_id"], 2);
++        assert_eq!(new_label["assignment"]["generation"], 3);
++        assert_eq!(new["calculation_id"], 4);
++    }
++
++    #[test]
++    fn producer_channel_isolation_clear_and_profile_mismatch() {
++        let producer = Producer::new();
++        producer.bind("device", "fan1", "graph");
++        producer.bind("device", "fan2", "mix");
++        producer.bind("other", "fan1", "graph");
++        let calc = producer.calculation("graph", 42, json!({"kind": "graph"}));
++        assert!(producer.label("device", "fan2", &calc).is_none());
++        assert!(producer.label("missing", "fan1", &calc).is_none());
++        producer.clear("device", "fan1");
++        assert!(producer.profile("device", "fan1").is_none());
++        assert!(producer.label("device", "fan1", &calc).is_none());
++        assert_eq!(producer.profile("device", "fan2").as_deref(), Some("mix"));
++        assert!(producer.label("other", "fan1", &calc).is_some());
++        producer.bind("device", "fan1", "graph");
++        assert!(producer.label("device", "fan1", &calc).is_none());
++    }
++
++    #[test]
++    fn producer_preserves_nested_retained_and_unknown_inputs() {
++        let producer = Producer::new();
++        let child = producer.calculation("graph", 42, json!({
++            "kind": "graph",
++            "sensor_sample": {"session": "sampler", "sampled_at_unix_ms": 123, "sample_id": 9},
++            "status_observations_newest_first": [{"temperature": 63.0, "status_unix_ms": 456, "sensor_sample": null}],
++        }));
++        producer.bind("device", "fan", "mix");
++        let inputs = json!({"kind": "mix", "members": [
++            {"profile_uid": "graph", "kind": "calculated", "retained": true, "calculation": child},
++            {"profile_uid": "unknown", "kind": "calculated", "retained": true, "calculation": null},
++            {"profile_uid": "fixed", "kind": "fixed", "duty": 50},
++        ]});
++        let calc = producer.calculation("mix", 50, inputs.clone());
++        let label: Value =
++            serde_json::from_str(&producer.label("device", "fan", &calc).unwrap()).unwrap();
++        assert_eq!(label["calculation"]["inputs"], inputs);
++        assert_eq!(
++            label["calculation"]["inputs"]["members"][0]["calculation"],
++            child
++        );
++    }
++
++    #[test]
++    fn producer_rejects_invalid_calculation_identity_and_clock_regression() {
++        let producer = Producer::new();
++        producer.bind("device", "fan", "graph");
++        let calc = producer.calculation("graph", 42, json!({"kind": "graph"}));
++        for (field, value) in [
++            ("calculation_id", json!(0)),
++            ("calculation_id", json!(u64::MAX)),
++            ("calculated_at_unix_ms", json!(0)),
++            ("calculated_at_unix_ms", Value::Null),
++            ("duty", json!(101)),
++            ("duty", json!(-1)),
++            ("inputs", Value::Null),
++        ] {
++            let mut invalid = calc.clone();
++            invalid[field] = value;
++            assert!(
++                producer.label("device", "fan", &invalid).is_none(),
++                "{field}"
++            );
++        }
++    }
++
++    #[test]
++    #[should_panic(expected = "producer identity counter exhausted")]
++    fn producer_counter_does_not_wrap() {
++        let producer = Producer::new();
++        producer.counter.set(u64::MAX);
++        producer.bind("device", "fan", "graph");
++    }
++
++    #[derive(Default)]
++    struct RecordingWriter {
++        writes: RefCell<Vec<(UID, String, Duty, String)>>,
++        fail: Cell<bool>,
++    }
++
++    #[async_trait(?Send)]
++    impl DutyWriter for RecordingWriter {
++        async fn write_device_duty(&self, _: &UID, _: &str, _: Duty) -> Result<()> {
++            panic!("label must not be downgraded to an ordinary write");
++        }
++
++        async fn write_device_duty_provenance(
++            &self,
++            device: &UID,
++            channel: &str,
++            duty: Duty,
++            label: &str,
++        ) -> Result<()> {
++            self.writes.borrow_mut().push((
++                device.clone(),
++                channel.to_owned(),
++                duty,
++                label.to_owned(),
++            ));
++            anyhow::ensure!(!self.fail.get(), "write failed");
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn producer_labeled_writer_preserves_bytes_and_propagates_failures() {
++        crate::cc_fs::test_runtime(async {
++            let producer = Producer::new();
++            producer.bind("device", "fan", "graph");
++            let calc = producer.calculation("graph", 42, json!({"kind": "graph"}));
++            let label = producer.label("device", "fan", &calc).unwrap();
++            let inner = Rc::new(RecordingWriter::default());
++            let writer = LabeledWriter::bind(inner.clone(), label.clone());
++            producer.bind("device", "fan", "different");
++            writer
++                .write_device_duty(&"device".to_owned(), "fan", 42)
++                .await
++                .unwrap();
++            inner.fail.set(true);
++            assert!(
++                writer
++                    .write_device_duty(&"device".to_owned(), "fan", 42)
++                    .await
++                    .is_err()
++            );
++            assert_eq!(
++                *inner.writes.borrow(),
++                vec![
++                    ("device".into(), "fan".into(), 42, label.clone()),
++                    ("device".into(), "fan".into(), 42, label),
++                ]
++            );
++        });
++    }
++}
+diff --git a/coolercontrold/daemon/src/engine/tests.rs b/coolercontrold/daemon/src/engine/tests.rs
+index 6b7d594ac335dee5f03c858215b03702bc138343..ea4b85d6dcf7e9670e66a2d6b6f5f0c474d3e041 100644
+--- a/coolercontrold/daemon/src/engine/tests.rs
++++ b/coolercontrold/daemon/src/engine/tests.rs
+@@ -19,7 +19,7 @@ mod engine_tests {
+         Function, FunctionKind, FunctionUID, LcdSettings, LightingSettings, Profile, ProfileKind,
+         ProfileUID, Setting, SettingKind, TempSource,
+     };
+-    use anyhow::{anyhow, Result};
++    use anyhow::{Result, anyhow};
+     use async_trait::async_trait;
+     use serial_test::serial;
+     use std::cell::{Cell, RefCell};
+@@ -32,6 +32,7 @@ mod engine_tests {
+     struct MockRepository {
+         device_type: DeviceType,
+         set_speeds: Rc<RefCell<Vec<u8>>>,
++        provenance: Rc<RefCell<Vec<String>>>,
+         applied_profiles: Rc<RefCell<Vec<Vec<(Temp, Duty)>>>>,
+         should_fail: Rc<Cell<bool>>,
+     }
+@@ -72,6 +73,17 @@ mod engine_tests {
+             Ok(())
+         }
+ 
++        async fn apply_setting_speed_fixed_provenance(
++            &self,
++            device: &UID,
++            channel: &str,
++            duty: u8,
++            label: &str,
++        ) -> Result<()> {
++            self.provenance.borrow_mut().push(label.to_owned());
++            self.apply_setting_speed_fixed(device, channel, duty).await
++        }
++
+         async fn apply_setting_speed_fixed(
+             &self,
+             _device_uid: &UID,
+@@ -138,6 +150,7 @@ mod engine_tests {
+         engine: Engine,
+         config: Rc<Config>,
+         set_speeds: Rc<RefCell<Vec<u8>>>,
++        provenance: Rc<RefCell<Vec<String>>>,
+         applied_profiles: Rc<RefCell<Vec<Vec<(Temp, Duty)>>>>,
+         should_fail: Rc<Cell<bool>>,
+         calibration_store: Rc<crate::calibration::CalibrationStore>,
+@@ -148,6 +161,7 @@ mod engine_tests {
+         let mut devices: HashMap<DeviceUID, DeviceLock> = HashMap::new();
+         let mut repos = Repositories::default();
+         let set_speeds = Rc::new(RefCell::new(Vec::new()));
++        let provenance = Rc::new(RefCell::new(Vec::new()));
+         let applied_profiles = Rc::new(RefCell::new(Vec::new()));
+         let should_fail = Rc::new(Cell::new(false));
+ 
+@@ -155,6 +169,7 @@ mod engine_tests {
+         let mock_repo = Rc::new(MockRepository {
+             device_type: DeviceType::Hwmon,
+             set_speeds: Rc::clone(&set_speeds),
++            provenance: Rc::clone(&provenance),
+             applied_profiles: Rc::clone(&applied_profiles),
+             should_fail: Rc::clone(&should_fail),
+         });
+@@ -196,6 +211,7 @@ mod engine_tests {
+             engine,
+             config,
+             set_speeds,
++            provenance,
+             applied_profiles,
+             should_fail,
+             calibration_store,
+@@ -471,6 +487,231 @@ mod engine_tests {
+         device.borrow_mut().set_status(status);
+     }
+ 
++    #[test]
++    #[serial]
++    fn producer_graph_complete_sample_contract() {
++        cc_fs::test_runtime(async {
++            let h = setup_harness();
++            let fan = create_controllable_fan(&h.device, "both-fans");
++            let temp = create_temp(&h.device, "cpu");
++            let uid = h.device.borrow().uid.clone();
++            let profile = create_graph_profile_with_temp_source(
++                &h.config,
++                vec![(30., 42), (70., 42)],
++                TempSource {
++                    device_uid: uid.clone(),
++                    temp_name: temp.clone(),
++                },
++            );
++            h.engine.set_profile(&uid, &fan, &profile).await.unwrap();
++            let assignment = h.engine.producer_assignment(&uid, &fan);
++            set_temp_status(&h.device, &temp, 63.);
++            // Test sampler data, not metadata generated by the producer.
++            let sample = serde_json::json!({
++                "session": "test-sampler-session", "generation": 7, "sample_id": 101,
++                "sampled_at_unix_ms": chrono::Utc::now().timestamp_millis(),
++                "sampled_at_monotonic_ns": 123456789, "sensor": "cpu", "power_state": "active",
++                "extension": {"preserve": [1, "literal", null]},
++            });
++            let timestamp = {
++                let mut device = h.device.borrow_mut();
++                let timestamp = device.status_history.back().unwrap().timestamp;
++                device.source_samples.push_back((
++                    timestamp,
++                    HashMap::from([(temp.clone(), sample.to_string())]),
++                ));
++                timestamp
++            };
++            moro_local::async_scope!(|scope| {
++                h.engine.process_scheduled_speeds(scope);
++                Ok(())
++            })
++            .await
++            .unwrap();
++            let labels = h.provenance.borrow();
++            assert_eq!(labels.len(), 1);
++            let command: serde_json::Value = serde_json::from_str(&labels[0]).unwrap();
++            for key in [
++                "schema",
++                "producer_session",
++                "device_uid",
++                "channel_name",
++                "assignment",
++            ] {
++                assert_eq!(command[key], assignment[key], "{key}");
++            }
++            let calculation = &command["calculation"];
++            assert_eq!(calculation["profile_uid"], profile);
++            assert_eq!(calculation["duty"], 42);
++            assert_eq!(*h.set_speeds.borrow(), vec![42]);
++            assert!(
++                calculation["calculation_id"].as_u64().unwrap()
++                    > assignment["assignment"]["generation"].as_u64().unwrap()
++            );
++            let inputs = &calculation["inputs"];
++            assert_eq!(inputs["source_device_uid"], uid);
++            assert_eq!(inputs["source_temp_name"], temp);
++            assert_eq!(inputs["sensor_sample"], sample);
++            let observation = &inputs["status_observations_newest_first"][0];
++            assert_eq!(observation["sensor_sample"], sample);
++            assert_eq!(observation["temperature"], 63.);
++            assert_eq!(observation["status_unix_ms"], timestamp.timestamp_millis());
++            // Optional test-only export for checking the actual engine output with
++            // an independently maintained consumer. No runtime dependency on Python.
++            if let Some(path) = std::env::var_os("CC_PRODUCER_TEST_FIXTURE") {
++                std::fs::write(
++                    path,
++                    serde_json::json!({
++                        "assignment": assignment, "command": command,
++                    })
++                    .to_string(),
++                )
++                .unwrap();
++            }
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn producer_mix_retains_original_member_calculation() {
++        cc_fs::test_runtime(async {
++            let h = setup_harness();
++            let fan = create_controllable_fan(&h.device, "fan1");
++            let (cpu, gpu) = create_two_temps(&h.device, "cpu", "gpu");
++            let uid = h.device.borrow().uid.clone();
++            let cpu_profile = create_graph_profile_with_temp_source(
++                &h.config,
++                vec![(30., 40), (70., 80)],
++                TempSource {
++                    device_uid: uid.clone(),
++                    temp_name: cpu.clone(),
++                },
++            );
++            let gpu_profile = create_graph_profile_with_temp_source(
++                &h.config,
++                vec![(30., 40), (70., 80)],
++                TempSource {
++                    device_uid: uid.clone(),
++                    temp_name: gpu.clone(),
++                },
++            );
++            let mix = Uuid::new_v4().to_string();
++            h.config
++                .set_profile(Profile {
++                    uid: mix.clone(),
++                    name: "Mix".into(),
++                    kind: ProfileKind::Mix {
++                        member_profile_uids: vec![cpu_profile.clone(), gpu_profile],
++                        mix_function_type: Some(crate::setting::ProfileMixFunctionType::Max),
++                    },
++                    ..Default::default()
++                })
++                .unwrap();
++            h.engine.set_profile(&uid, &fan, &mix).await.unwrap();
++            for gpu_temp in [30., 70.] {
++                set_two_temp_status(&h.device, &cpu, 30., &gpu, gpu_temp);
++                moro_local::async_scope!(|scope| {
++                    h.engine.process_scheduled_speeds(scope);
++                    Ok(())
++                })
++                .await
++                .unwrap();
++            }
++            let labels: Vec<serde_json::Value> = h
++                .provenance
++                .borrow()
++                .iter()
++                .map(|s| serde_json::from_str(s).unwrap())
++                .collect();
++            assert_eq!(labels.len(), 2);
++            let member = |i: usize| {
++                labels[i]["calculation"]["inputs"]["members"]
++                    .as_array()
++                    .unwrap()
++                    .iter()
++                    .find(|m| m["profile_uid"] == cpu_profile)
++                    .unwrap()
++            };
++            assert_eq!(member(0)["retained"], false);
++            assert_eq!(member(1)["retained"], true);
++            assert_eq!(member(0)["calculation"], member(1)["calculation"]);
++            assert_ne!(
++                labels[0]["calculation"]["calculation_id"],
++                labels[1]["calculation"]["calculation_id"]
++            );
++            assert_eq!(labels[0]["assignment"], labels[1]["assignment"]);
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn producer_queue_retains_assignment_and_original_sample() {
++        cc_fs::test_runtime(async {
++            let h = setup_harness();
++            let fan = create_controllable_fan(&h.device, "fan1");
++            let temp = create_temp(&h.device, "temp1");
++            let uid = h.device.borrow().uid.clone();
++            let profile = create_graph_profile_with_temp_source(
++                &h.config,
++                vec![(30., 40), (70., 80)],
++                TempSource {
++                    device_uid: uid.clone(),
++                    temp_name: temp.clone(),
++                },
++            );
++            h.engine.set_profile(&uid, &fan, &profile).await.unwrap();
++            let old_assignment = h.engine.producer_assignment(&uid, &fan);
++            let result = moro_local::async_scope!(|scope| {
++                set_temp_status(&h.device, &temp, 30.);
++                {
++                    let mut device = h.device.borrow_mut();
++                    let timestamp = device.status_history.back().unwrap().timestamp;
++                    device.source_samples.push_back((timestamp, HashMap::from([(temp.clone(),
++                        serde_json::json!({"session":"sampler-A", "generation":7,"sample_id":101,"sampled_at_unix_ms":123}).to_string())])));
++                }
++                h.engine.process_scheduled_speeds(scope);
++                // The first task has been queued but has not run. Reassign the same profile.
++                h.engine.set_profile(&uid, &fan, &profile).await.unwrap();
++                set_temp_status(&h.device, &temp, 70.);
++                h.engine.process_scheduled_speeds(scope);
++                Ok(())
++            }).await;
++            assert!(result.is_ok());
++            let labels: Vec<serde_json::Value> = h
++                .provenance
++                .borrow()
++                .iter()
++                .map(|s| serde_json::from_str(s).unwrap())
++                .collect();
++            assert_eq!(labels.len(), 2);
++            let old = labels
++                .iter()
++                .find(|l| l["calculation"]["duty"] == 40)
++                .unwrap();
++            let new = labels
++                .iter()
++                .find(|l| l["calculation"]["duty"] == 80)
++                .unwrap();
++            assert_eq!(old["assignment"], old_assignment["assignment"]);
++            assert_ne!(
++                old["assignment"]["generation"],
++                new["assignment"]["generation"]
++            );
++            assert_eq!(
++                old["calculation"]["inputs"]["status_observations_newest_first"][0]["sensor_sample"]
++                    ["sample_id"],
++                101
++            );
++            assert!(new["calculation"]["inputs"]["status_observations_newest_first"][0]["sensor_sample"].is_null());
++            assert_eq!(
++                old["calculation"]["inputs"]["sensor_sample"],
++                old["calculation"]["inputs"]["status_observations_newest_first"][0]["sensor_sample"]
++            );
++            // An older sample in history must not fill in for a missing newest sample.
++            assert!(new["calculation"]["inputs"]["sensor_sample"].is_null());
++        });
++    }
++
+     #[test]
+     #[serial]
+     fn test_no_application_without_settings() {
+@@ -1909,7 +2150,7 @@ mod engine_tests {
+         // stored setting must be left untouched. Verifies both the
+         // snapshot classification and the restore routing.
+         use crate::calibration::{DiagnosisHost, SnapshotKind};
+-        use crate::setting::{Setting, SettingKind, DEFAULT_PROFILE_UID};
++        use crate::setting::{DEFAULT_PROFILE_UID, Setting, SettingKind};
+         cc_fs::test_runtime(async {
+             let (engine, config, device_uid, set_speeds) = setup_engine_with_speed_recorder();
+ 
+diff --git a/coolercontrold/daemon/src/grpc_api/cc_device_service.rs b/coolercontrold/daemon/src/grpc_api/cc_device_service.rs
+index b8c80d7b6405b51ca7ad23c798ef00da8b2a3089..1cb9d6f11906cd14be1d7e996efffe575edc25ac 100644
+--- a/coolercontrold/daemon/src/grpc_api/cc_device_service.rs
++++ b/coolercontrold/daemon/src/grpc_api/cc_device_service.rs
+@@ -1,17 +1,18 @@
+ // SPDX-FileCopyrightText: 2025 Guy Boldon, Eren Simsek and contributors
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++use crate::VERSION;
+ use crate::api::actor::{DeviceHandle, StatusHandle};
+ use crate::api::devices::DeviceDto;
+ use crate::api::status::DeviceStatusDto;
+ use crate::device::{ChannelInfo, ChannelKind, ChannelStatus, TempInfo, TempStatus};
+ use crate::grpc_api::device_service::v1::device_service_server::DeviceService;
+-use crate::grpc_api::device_service::v1::{health_response, HealthRequest, HealthResponse};
+ use crate::grpc_api::device_service::v1::{CustomFunctionOneRequest, CustomFunctionOneResponse};
+ use crate::grpc_api::device_service::v1::{
+     EnableManualFanControlRequest, EnableManualFanControlResponse,
+ };
+ use crate::grpc_api::device_service::v1::{FixedDutyRequest, FixedDutyResponse};
++use crate::grpc_api::device_service::v1::{HealthRequest, HealthResponse, health_response};
+ use crate::grpc_api::device_service::v1::{InitializeDeviceRequest, InitializeDeviceResponse};
+ use crate::grpc_api::device_service::v1::{LcdRequest, LcdResponse};
+ use crate::grpc_api::device_service::v1::{LightingRequest, LightingResponse};
+@@ -22,7 +23,6 @@ use crate::grpc_api::device_service::v1::{SpeedProfileRequest, SpeedProfileRespo
+ use crate::grpc_api::device_service::v1::{StatusRequest, StatusResponse};
+ use crate::grpc_api::models;
+ use crate::grpc_api::models::v1::status::FanSpeed;
+-use crate::VERSION;
+ use nix::unistd::Pid;
+ use tonic::{Request, Response, Status};
+ 
+@@ -280,6 +280,7 @@ impl From<DeviceStatusDto> for Vec<models::v1::Status> {
+ impl From<TempStatus> for models::v1::Status {
+     fn from(value: TempStatus) -> Self {
+         Self {
++            sample_provenance_json: String::new(),
+             id: value.name,
+             metric: Some(models::v1::status::Metric::Temp(value.temp)),
+         }
+@@ -299,6 +300,7 @@ impl From<ChannelStatus> for models::v1::Status {
+             value.freq.map(models::v1::status::Metric::Mhz)
+         };
+         Self {
++            sample_provenance_json: String::new(),
+             id: value.name,
+             metric,
+         }
+diff --git a/coolercontrold/daemon/src/repositories/repository.rs b/coolercontrold/daemon/src/repositories/repository.rs
+index 2c9e8350946b27b792417afdac925211e5308a6b..e872355c063c04d1b485f225c7585ff12b1e6e72 100644
+--- a/coolercontrold/daemon/src/repositories/repository.rs
++++ b/coolercontrold/daemon/src/repositories/repository.rs
+@@ -4,10 +4,10 @@
+ use std::cell::RefCell;
+ use std::rc::Rc;
+ 
++use crate::Device;
+ use crate::device::{DeviceType, Duty, UID};
+ use crate::device_health::{FailsafeRef, UnreachableRef};
+ use crate::setting::{LcdSettings, LightingSettings, TempSource};
+-use crate::Device;
+ use anyhow::Result;
+ use async_trait::async_trait;
+ use thiserror::Error;
+@@ -64,6 +64,18 @@ pub trait Repository {
+         speed_fixed: u8,
+     ) -> Result<()>;
+ 
++    /// Repositories without a provenance protocol retain their ordinary behavior.
++    async fn apply_setting_speed_fixed_provenance(
++        &self,
++        device_uid: &UID,
++        channel_name: &str,
++        speed_fixed: u8,
++        _provenance: &str,
++    ) -> Result<()> {
++        self.apply_setting_speed_fixed(device_uid, channel_name, speed_fixed)
++            .await
++    }
++
+     /// This is for device-internal profiles only, such as some AIOs.
+     /// The temp source must then always belong to the device itself.
+     /// Everything else is handled by `CoolerControl` itself.
+diff --git a/coolercontrold/daemon/src/repositories/service_plugin/client.rs b/coolercontrold/daemon/src/repositories/service_plugin/client.rs
+index 5bde2c2fc8b4464ae3e1b0412b49adacc5232f59..3fc179edc498f026fea0b1e1ac82ca99069e7e67 100644
+--- a/coolercontrold/daemon/src/repositories/service_plugin/client.rs
++++ b/coolercontrold/daemon/src/repositories/service_plugin/client.rs
+@@ -7,21 +7,21 @@ use crate::device::{
+     LightingModeType, SpeedOptions, Temp, TempInfo, TempStatus,
+ };
+ use crate::grpc_api::device_service::v1::{
+-    device_service_client, CustomFunctionOneRequest, EnableManualFanControlRequest,
+-    FixedDutyRequest, HealthRequest, HealthResponse, InitializeDeviceRequest, LcdRequest,
+-    LcdSetting, LightingRequest, LightingSetting, ListDevicesRequest, ListDevicesResponse,
+-    ResetChannelRequest, Rgb, ShutdownRequest, SpeedProfilePoint, SpeedProfileRequest,
+-    StatusRequest, StatusResponse,
++    CustomFunctionOneRequest, EnableManualFanControlRequest, FixedDutyRequest, HealthRequest,
++    HealthResponse, InitializeDeviceRequest, LcdRequest, LcdSetting, LightingRequest,
++    LightingSetting, ListDevicesRequest, ListDevicesResponse, ResetChannelRequest, Rgb,
++    ShutdownRequest, SpeedProfilePoint, SpeedProfileRequest, StatusRequest, StatusResponse,
++    device_service_client,
+ };
+ use crate::grpc_api::models;
++use crate::grpc_api::models::v1::ChannelExtensionName;
+ use crate::grpc_api::models::v1::channel_info::Options;
+ use crate::grpc_api::models::v1::status::Metric;
+-use crate::grpc_api::models::v1::ChannelExtensionName;
+ use crate::repositories::service_plugin::service_management::ServiceId;
+ use crate::repositories::service_plugin::service_manifest::{ConnectionType, ServiceManifest};
+ use crate::repositories::service_plugin::service_plugin_repo::ServiceDeviceID;
+ use crate::setting::{LcdSettings, LightingSettings, TempSource};
+-use anyhow::{anyhow, Result};
++use anyhow::{Result, anyhow};
+ use log::error;
+ use std::cell::RefCell;
+ use std::collections::HashMap;
+@@ -30,8 +30,8 @@ use std::rc::Rc;
+ use std::time::Duration;
+ use tokio::sync::Mutex;
+ use tokio::time::sleep;
+-use tonic::transport::Channel;
+ use tonic::Request;
++use tonic::transport::Channel;
+ 
+ use crate::repositories::failsafe::MISSING_STATUS_THRESHOLD;
+ 
+@@ -387,7 +387,7 @@ impl DeviceServiceClient {
+     pub async fn status(
+         &self,
+         device_uid: &DeviceUID,
+-    ) -> Result<(Vec<ChannelStatus>, Vec<TempStatus>)> {
++    ) -> Result<(Vec<ChannelStatus>, Vec<TempStatus>, HashMap<String, String>)> {
+         let device_client = self.get_device_client(device_uid)?;
+         tokio::select! {
+             () = sleep(self.service_wait_timeout) => Err(anyhow!(
+@@ -408,9 +408,10 @@ impl DeviceServiceClient {
+ 
+     fn map_status(
+         status_response: tonic::Response<StatusResponse>,
+-    ) -> (Vec<ChannelStatus>, Vec<TempStatus>) {
++    ) -> (Vec<ChannelStatus>, Vec<TempStatus>, HashMap<String, String>) {
+         let mut channel_status = vec![];
+         let mut temp_status = vec![];
++        let mut samples = HashMap::new();
+         for status in status_response.into_inner().status {
+             let Some(metric) = status.metric else {
+                 error!("Status Metric is missing for {}", status.id);
+@@ -418,6 +419,11 @@ impl DeviceServiceClient {
+             };
+             match metric {
+                 Metric::Temp(temp) => {
++                    if !status.sample_provenance_json.is_empty()
++                        && status.sample_provenance_json.len() <= 16384
++                    {
++                        samples.insert(status.id.clone(), status.sample_provenance_json);
++                    }
+                     temp_status.push(TempStatus {
+                         name: status.id,
+                         temp,
+@@ -447,7 +453,7 @@ impl DeviceServiceClient {
+                 }
+             }
+         }
+-        (channel_status, temp_status)
++        (channel_status, temp_status, samples)
+     }
+ 
+     pub async fn reset_channel(&self, device_uid: &DeviceUID, channel_name: &str) -> Result<()> {
+@@ -497,6 +503,7 @@ impl DeviceServiceClient {
+         device_uid: &DeviceUID,
+         channel_name: &str,
+         duty: Duty,
++        provenance_json: String,
+     ) -> Result<()> {
+         let device_client = self.get_device_client(device_uid)?;
+         tokio::select! {
+@@ -510,6 +517,7 @@ impl DeviceServiceClient {
+                     device_id: self.get_service_device_id(device_uid)?,
+                     channel_id: channel_name.to_owned(),
+                     duty: i32::from(duty),
++                    provenance_json,
+                 });
+                 device_client.fixed_duty(request).await
+                 .map(|_| ())
+@@ -669,6 +677,23 @@ fn safe_u8(value: u32) -> u8 {
+ mod wait_timeout_tests {
+     use super::*;
+ 
++    #[test]
++    fn producer_sample_survives_status_protobuf_mapping() {
++        use prost::Message;
++        let sample = r#"{"session":"sampler","sample_id":77,"sampled_at_unix_ms":100}"#;
++        let response = StatusResponse {
++            status: vec![models::v1::Status {
++                id: "cpu".into(),
++                metric: Some(Metric::Temp(63.5)),
++                sample_provenance_json: sample.into(),
++            }],
++        };
++        let decoded = StatusResponse::decode(response.encode_to_vec().as_slice()).unwrap();
++        let (_, temps, samples) = DeviceServiceClient::map_status(tonic::Response::new(decoded));
++        assert_eq!(temps[0].temp, 63.5);
++        assert_eq!(samples["cpu"], sample);
++    }
++
+     #[test]
+     fn wait_timeout_matches_legacy_at_default_poll_rate() {
+         // Regression: at the default poll_rate = 1.0 s the formula
+diff --git a/coolercontrold/daemon/src/repositories/service_plugin/client_proxy.rs b/coolercontrold/daemon/src/repositories/service_plugin/client_proxy.rs
+index 11db016025ec7fa4b9002cba5bc96e4ae9d54bc4..81d33735457d45e4e11556ea2c1eb98201dad655 100644
+--- a/coolercontrold/daemon/src/repositories/service_plugin/client_proxy.rs
++++ b/coolercontrold/daemon/src/repositories/service_plugin/client_proxy.rs
+@@ -21,7 +21,7 @@ use super::service_plugin_repo::ServiceDeviceID;
+ use crate::device::{ChannelStatus, Device, DeviceUID, Duty, Temp, TempStatus};
+ use crate::grpc_api::device_service::v1::{HealthResponse, ListDevicesResponse};
+ use crate::setting::{LcdSettings, LightingSettings, TempSource};
+-use anyhow::{anyhow, Result};
++use anyhow::{Result, anyhow};
+ use std::rc::Rc;
+ use tokio::sync::{mpsc, oneshot};
+ 
+@@ -51,7 +51,13 @@ enum DeviceServiceRequest {
+     },
+     Status {
+         device_uid: DeviceUID,
+-        respond_to: oneshot::Sender<Result<(Vec<ChannelStatus>, Vec<TempStatus>)>>,
++        respond_to: oneshot::Sender<
++            Result<(
++                Vec<ChannelStatus>,
++                Vec<TempStatus>,
++                std::collections::HashMap<String, String>,
++            )>,
++        >,
+     },
+     ResetChannel {
+         device_uid: DeviceUID,
+@@ -67,6 +73,7 @@ enum DeviceServiceRequest {
+         device_uid: DeviceUID,
+         channel_name: String,
+         duty: Duty,
++        provenance_json: String,
+         respond_to: oneshot::Sender<Result<()>>,
+     },
+     SpeedProfile {
+@@ -175,7 +182,11 @@ impl DeviceServiceClientHandle {
+     pub async fn status(
+         &self,
+         device_uid: &DeviceUID,
+-    ) -> Result<(Vec<ChannelStatus>, Vec<TempStatus>)> {
++    ) -> Result<(
++        Vec<ChannelStatus>,
++        Vec<TempStatus>,
++        std::collections::HashMap<String, String>,
++    )> {
+         let (tx, rx) = oneshot::channel();
+         self.send(DeviceServiceRequest::Status {
+             device_uid: device_uid.clone(),
+@@ -216,12 +227,24 @@ impl DeviceServiceClientHandle {
+         device_uid: &DeviceUID,
+         channel_name: &str,
+         duty: Duty,
++    ) -> Result<()> {
++        self.fixed_duty_provenance(device_uid, channel_name, duty, String::new())
++            .await
++    }
++
++    pub async fn fixed_duty_provenance(
++        &self,
++        device_uid: &DeviceUID,
++        channel_name: &str,
++        duty: Duty,
++        provenance_json: String,
+     ) -> Result<()> {
+         let (tx, rx) = oneshot::channel();
+         self.send(DeviceServiceRequest::FixedDuty {
+             device_uid: device_uid.clone(),
+             channel_name: channel_name.to_owned(),
+             duty,
++            provenance_json,
+             respond_to: tx,
+         })
+         .await?;
+@@ -352,9 +375,14 @@ async fn handle_request(client: Rc<DeviceServiceClient>, request: DeviceServiceR
+             device_uid,
+             channel_name,
+             duty,
++            provenance_json,
+             respond_to,
+         } => {
+-            let _ = respond_to.send(client.fixed_duty(&device_uid, &channel_name, duty).await);
++            let _ = respond_to.send(
++                client
++                    .fixed_duty(&device_uid, &channel_name, duty, provenance_json)
++                    .await,
++            );
+         }
+         DeviceServiceRequest::SpeedProfile {
+             device_uid,
+@@ -468,7 +496,11 @@ mod tests {
+                 }
+                 DeviceServiceRequest::Status { respond_to, .. } => {
+                     seen.push("status");
+-                    let _ = respond_to.send(Ok((Vec::new(), Vec::new())));
++                    let _ = respond_to.send(Ok((
++                        Vec::new(),
++                        Vec::new(),
++                        std::collections::HashMap::new(),
++                    )));
+                 }
+                 DeviceServiceRequest::ResetChannel { respond_to, .. } => {
+                     seen.push("reset_channel");
+@@ -498,6 +530,40 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn producer_label_survives_queue_and_rpc_failure_propagates() {
++        crate::rt::test_runtime(async {
++            let (handle, mut rx) = test_handle();
++            let original =
++                r#"{"schema":1,"producer_session":"old","assignment":{"generation":1}}"#.to_owned();
++            let expected = original.clone();
++            let send = async {
++                let result = handle
++                    .fixed_duty_provenance(&"dev".to_owned(), "fan", 42, original)
++                    .await;
++                assert!(result.unwrap_err().to_string().contains("consumer refused"));
++            };
++            let receive = async {
++                match rx.recv().await.unwrap() {
++                    DeviceServiceRequest::FixedDuty {
++                        provenance_json,
++                        duty,
++                        respond_to,
++                        ..
++                    } => {
++                        assert_eq!(provenance_json, expected);
++                        assert_eq!(duty, 42);
++                        respond_to
++                            .send(Err(anyhow::anyhow!("consumer refused")))
++                            .unwrap();
++                    }
++                    _ => panic!("wrong request"),
++                }
++            };
++            tokio::join!(send, receive);
++        });
++    }
++
+     #[test]
+     fn handle_routes_every_method_to_its_request() {
+         crate::rt::test_runtime(async {
+@@ -519,10 +585,12 @@ mod tests {
+                 assert!(handle.enable_manual_fan_control(&uid, "fan1").await.is_ok());
+                 assert!(handle.fixed_duty(&uid, "fan1", 50).await.is_ok());
+                 let profile = vec![(30.0_f64, 40_u8), (60.0, 80)];
+-                assert!(handle
+-                    .speed_profile(&uid, "fan1", &temp_source(), &profile)
+-                    .await
+-                    .is_ok());
++                assert!(
++                    handle
++                        .speed_profile(&uid, "fan1", &temp_source(), &profile)
++                        .await
++                        .is_ok()
++                );
+                 assert!(handle.lighting(&uid, "led1", &lighting()).await.is_ok());
+                 assert!(handle.lcd(&uid, "lcd1", &lcd()).await.is_ok());
+                 assert!(handle.shutdown().await.is_ok());
+@@ -573,11 +641,13 @@ mod tests {
+                         device_uid,
+                         channel_name,
+                         duty,
++                        provenance_json,
+                         respond_to,
+                     } => {
+                         assert_eq!(device_uid, "dev-9");
+                         assert_eq!(channel_name, "pump");
+                         assert_eq!(duty, 73);
++                        assert!(provenance_json.is_empty());
+                         let _ = respond_to.send(Ok(()));
+                     }
+                     _ => panic!("expected FixedDuty request"),
+@@ -618,15 +688,19 @@ mod tests {
+             assert!(handle.initialize_device(&uid).await.is_err());
+             assert!(handle.status(&uid).await.is_err());
+             assert!(handle.reset_channel(&uid, "fan1").await.is_err());
+-            assert!(handle
+-                .enable_manual_fan_control(&uid, "fan1")
+-                .await
+-                .is_err());
++            assert!(
++                handle
++                    .enable_manual_fan_control(&uid, "fan1")
++                    .await
++                    .is_err()
++            );
+             assert!(handle.fixed_duty(&uid, "fan1", 10).await.is_err());
+-            assert!(handle
+-                .speed_profile(&uid, "fan1", &temp_source(), &[(30.0, 40)])
+-                .await
+-                .is_err());
++            assert!(
++                handle
++                    .speed_profile(&uid, "fan1", &temp_source(), &[(30.0, 40)])
++                    .await
++                    .is_err()
++            );
+             assert!(handle.lighting(&uid, "led1", &lighting()).await.is_err());
+             assert!(handle.lcd(&uid, "lcd1", &lcd()).await.is_err());
+             assert!(handle.shutdown().await.is_err());
+diff --git a/coolercontrold/daemon/src/repositories/service_plugin/service_plugin_repo.rs b/coolercontrold/daemon/src/repositories/service_plugin/service_plugin_repo.rs
+index 74392e1f95c9e8c073bc419c32a2007422907cda..08693cb61b930f6405b2a96a452a85bfc00e2e15 100644
+--- a/coolercontrold/daemon/src/repositories/service_plugin/service_plugin_repo.rs
++++ b/coolercontrold/daemon/src/repositories/service_plugin/service_plugin_repo.rs
+@@ -15,22 +15,22 @@ use crate::repositories::failsafe::{self, FailsafeStatusData};
+ use crate::repositories::repository::{DeviceList, DeviceLock, Repository};
+ use crate::repositories::service_plugin::client_proxy::DeviceServiceClientHandle;
+ use crate::repositories::service_plugin::plugin_controller::{
+-    secure_config_file, secure_plugin_folder, PLUGIN_CONFIG_FILE_NAME,
++    PLUGIN_CONFIG_FILE_NAME, secure_config_file, secure_plugin_folder,
+ };
+ use crate::repositories::service_plugin::service_management::manager::{
+     Manager, ServiceDefinition, ServiceManager, ServiceStatus,
+ };
+ use crate::repositories::service_plugin::service_management::{
+-    delete_plugin_user, ServiceId, ServiceIdExt,
++    ServiceId, ServiceIdExt, delete_plugin_user,
+ };
+ use crate::repositories::service_plugin::service_manifest::{EnvVar, ServiceManifest, ServiceType};
+ use crate::repositories::utils::apply_device_command_delay;
+ use crate::rt::sleep;
+ use crate::setting::{CCDeviceSettings, LcdSettings, LightingSettings, TempSource};
+-use crate::{cc_fs, ENV_CC_LOG};
+-use anyhow::{anyhow, Context, Result};
++use crate::{ENV_CC_LOG, cc_fs};
++use anyhow::{Context, Result, anyhow};
+ use async_trait::async_trait;
+-use log::{debug, error, info, trace, warn, LevelFilter};
++use log::{LevelFilter, debug, error, info, trace, warn};
+ use std::cell::RefCell;
+ use std::collections::{HashMap, HashSet};
+ use std::ops::Not;
+@@ -79,6 +79,7 @@ pub struct ServicePluginRepo {
+ /// because `tick_per_channel_staleness` operates on `&mut Vec`.
+ #[derive(Debug, Default)]
+ struct PreloadData {
++    samples: HashMap<String, String>,
+     channels: Vec<ChannelStatus>,
+     temps: Vec<TempStatus>,
+ }
+@@ -691,7 +692,8 @@ impl ServicePluginRepo {
+             return;
+         }
+         apply_device_command_delay(delay).await;
+-        let Ok((mut channel_statuses, mut temp_statuses)) = service.client.status(device_uid).await
++        let Ok((mut channel_statuses, mut temp_statuses, samples)) =
++            service.client.status(device_uid).await
+         else {
+             error!(
+                 "Error getting device status for {device_uid} from Service {}. Skipping.",
+@@ -742,6 +744,7 @@ impl ServicePluginRepo {
+                 .insert(device_uid.clone(), fsd);
+         }
+         let preload_data = PreloadData {
++            samples,
+             channels: channel_statuses.clone(),
+             temps: temp_statuses.clone(),
+         };
+@@ -763,6 +766,9 @@ impl ServicePluginRepo {
+     /// failsafe. The preload cache is left intact, so last-known-good values are
+     /// served during the grace window before the threshold.
+     fn note_status_failure(&self, device_uid: &DeviceUID, device_name: &str) {
++        if let Some(cache) = self.preloaded_statuses.borrow_mut().get_mut(device_uid) {
++            cache.samples.clear();
++        }
+         let mut failsafe_lock = self.failsafe_statuses.borrow_mut();
+         let Some(fsd) = failsafe_lock.get_mut(device_uid) else {
+             return;
+@@ -784,7 +790,7 @@ impl ServicePluginRepo {
+     ) {
+         let delay = self.device_delay(&device_uid);
+         let device_name = self.log_device_name(&device_uid);
+-        let Ok((mut channel_statuses, mut temp_statuses)) =
++        let Ok((mut channel_statuses, mut temp_statuses, samples)) =
+             service.client.status(&device_uid).await
+         else {
+             self.note_status_failure(&device_uid, &device_name);
+@@ -797,6 +803,10 @@ impl ServicePluginRepo {
+         temp_statuses
+             .retain(|s| Self::retain_enabled_channels(&s.name, disabled_channels_for_device));
+         self.record_fresh_statuses(&device_uid, &device_name, channel_statuses, temp_statuses);
++        if let Some(cache) = self.preloaded_statuses.borrow_mut().get_mut(&device_uid) {
++            // Missing sensors lose metadata immediately, even while numeric grace-cache persists.
++            cache.samples = samples;
++        }
+         apply_device_command_delay(delay).await;
+     }
+ 
+@@ -818,6 +828,7 @@ impl ServicePluginRepo {
+             self.preloaded_statuses.borrow_mut().insert(
+                 device_uid.clone(),
+                 PreloadData {
++                    samples: HashMap::new(),
+                     channels: channel_statuses,
+                     temps: temp_statuses,
+                 },
+@@ -1017,11 +1028,17 @@ impl Repository for ServicePluginRepo {
+ 
+     async fn update_statuses(&self) -> Result<()> {
+         for (device_uid, (device_lock, _)) in &self.devices {
+-            let (temps, channels) = self
++            let (temps, channels, samples) = self
+                 .preloaded_statuses
+                 .borrow()
+                 .get(device_uid)
+-                .map(|data| (data.temps.clone(), data.channels.clone()))
++                .map(|data| {
++                    (
++                        data.temps.clone(),
++                        data.channels.clone(),
++                        data.samples.clone(),
++                    )
++                })
+                 .expect("Preloaded Data should always be present");
+             let status = Status {
+                 temps,
+@@ -1032,7 +1049,12 @@ impl Repository for ServicePluginRepo {
+                 "Hwmon device: {} status was updated with: {status:?}",
+                 device_lock.borrow().name
+             );
+-            device_lock.borrow_mut().set_status(status);
++            let mut device = device_lock.borrow_mut();
++            device.source_samples.push_back((status.timestamp, samples));
++            device.set_status(status);
++            while device.source_samples.len() > device.status_history.len() {
++                device.source_samples.pop_front();
++            }
+         }
+         Ok(())
+     }
+@@ -1120,6 +1142,17 @@ impl Repository for ServicePluginRepo {
+         device_uid: &UID,
+         channel_name: &str,
+         speed_fixed: u8,
++    ) -> Result<()> {
++        self.apply_setting_speed_fixed_provenance(device_uid, channel_name, speed_fixed, "")
++            .await
++    }
++
++    async fn apply_setting_speed_fixed_provenance(
++        &self,
++        device_uid: &UID,
++        channel_name: &str,
++        speed_fixed: u8,
++        provenance: &str,
+     ) -> Result<()> {
+         if speed_fixed > 100 {
+             return Err(anyhow!("Invalid fixed_speed: {speed_fixed}"));
+@@ -1150,7 +1183,7 @@ impl Repository for ServicePluginRepo {
+         );
+         let result = device_service
+             .client
+-            .fixed_duty(device_uid, channel_name, speed_fixed)
++            .fixed_duty_provenance(device_uid, channel_name, speed_fixed, provenance.to_owned())
+             .await
+             .map_err(|status| anyhow!("Error applying fixed speed for device channel: {status}"));
+         apply_device_command_delay(self.device_delay(device_uid)).await;
+@@ -1329,8 +1362,8 @@ impl Repository for ServicePluginRepo {
+ #[cfg(test)]
+ mod tests {
+     use super::{
+-        synthesize_failsafe_seed, upsert_channel, upsert_temp, ServicePluginRepo,
+-        SERVICE_MANIFEST_FILE_NAME,
++        SERVICE_MANIFEST_FILE_NAME, ServicePluginRepo, synthesize_failsafe_seed, upsert_channel,
++        upsert_temp,
+     };
+     use crate::device::{
+         ChannelInfo, ChannelKind, ChannelStatus, DeviceInfo, SpeedOptions, TempInfo, TempStatus,
+@@ -1339,6 +1372,41 @@ mod tests {
+     use std::ops::Not;
+     use std::path::Path;
+ 
++    #[test]
++    fn producer_samples_are_removed_on_read_failure_without_refreshing_cached_temperature() {
++        crate::cc_fs::test_runtime(async {
++            let repo = ServicePluginRepo {
++                config: std::rc::Rc::new(crate::config::Config::init_default_config().unwrap()),
++                overrides: std::rc::Rc::new(crate::overrides::OverridesController::empty()),
++                service_manager: super::Manager::Disabled,
++                api_up_token: tokio_util::sync::CancellationToken::new(),
++                reset_plugin_user: false,
++                services: Default::default(),
++                devices: Default::default(),
++                hardware_support: None,
++                preloaded_statuses: Default::default(),
++                failsafe_statuses: Default::default(),
++                disabled_channels: Default::default(),
++                device_delays: Default::default(),
++            };
++            repo.preloaded_statuses.borrow_mut().insert(
++                "d".into(),
++                super::PreloadData {
++                    samples: std::collections::HashMap::from([(
++                        "cpu".into(),
++                        "{\"sample_id\":1}".into(),
++                    )]),
++                    temps: vec![temp("cpu", 63.)],
++                    channels: vec![],
++                },
++            );
++            repo.note_status_failure(&"d".into(), "test");
++            let cache = repo.preloaded_statuses.borrow();
++            assert!(cache["d"].samples.is_empty());
++            assert_eq!(cache["d"].temps[0].temp, 63.);
++        });
++    }
++
+     fn device_info_with(channels: Vec<(&str, ChannelKind)>, temps: Vec<&str>) -> DeviceInfo {
+         let mut info = DeviceInfo::default();
+         for (name, kind) in channels {
+@@ -1426,7 +1494,7 @@ mod tests {
+         assert!(names.contains(&"power"));
+         assert!(names.contains(&"rgb").not()); // lighting excluded
+         assert!(names.contains(&"screen").not()); // lcd excluded
+-                                                  // Stubs carry no metric shape; it is only known from a real read.
++        // Stubs carry no metric shape; it is only known from a real read.
+         let fan_stub = channels.iter().find(|c| c.name == "fan").unwrap();
+         assert!(fan_stub.rpm.is_none());
+         assert!(fan_stub.duty.is_none());
+@@ -1525,9 +1593,13 @@ mod tests {
+                 "bad_privileged",
+                 Some("id = \"bad_privileged\"\ntype = \"device\"\nprivileged = \"true\"\n"),
+             );
+-            write_plugin(root, "bad_proxy", Some(
+-                "id = \"bad_proxy\"\ntype = \"device\"\nproxy = { enabled = true, port = 80 }\n",
+-            ));
++            write_plugin(
++                root,
++                "bad_proxy",
++                Some(
++                    "id = \"bad_proxy\"\ntype = \"device\"\nproxy = { enabled = true, port = 80 }\n",
++                ),
++            );
+             write_plugin(
+                 root,
+                 "bad_control_char",
+@@ -1575,9 +1647,11 @@ mod tests {
+     fn an_empty_plugins_directory_yields_no_plugins() {
+         crate::rt::test_runtime(async {
+             let plugins = tempfile::tempdir().unwrap();
+-            assert!(ServicePluginRepo::find_service_manifests_in(plugins.path())
+-                .await
+-                .is_empty());
++            assert!(
++                ServicePluginRepo::find_service_manifests_in(plugins.path())
++                    .await
++                    .is_empty()
++            );
+         });
+     }
+ }
+diff --git a/openapi/openapi.json b/openapi/openapi.json
+index 429a5f8dd357d69daa2027167a6867202a97f0c2..3c6188b82c2770ee12d1cf8882c294c46dc74626 100644
+--- a/openapi/openapi.json
++++ b/openapi/openapi.json
+@@ -811,7 +811,12 @@
+         },
+         "responses": {
+           "200": {
+-            "description": "no content"
++            "description": "",
++            "content": {
++              "application/json": {
++                "schema": true
++              }
++            }
+           },
+           "400": {
+             "description": "Bad Request. The request is invalid"

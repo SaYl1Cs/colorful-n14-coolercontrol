@@ -1,7 +1,7 @@
 [Unit]
-Description=Cache CPU and NVIDIA temperatures for Colorful N14 CoolerControl
+Description=Read-only EC CPU/GPU snapshot sampler for Colorful N14
 Requires=colorful-n14-nbfc-prepare.service
-After=colorful-n14-nbfc-prepare.service nvidia-persistenced.service
+After=colorful-n14-nbfc-prepare.service
 Before=coolercontrold.service
 
 [Service]
@@ -16,8 +16,7 @@ NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/run/colorful-n14-control
-# N14_GPU_POLL=never is a strict no-NVML mode; see README for cooling trade-offs.
-Environment=N14_GPU_POLL=never
+# Temperature access is read-only ec0/io; PCI runtime/power state is sysfs-only.
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+13f68a4305a5b6167f88121eb78c662c735bd8473646fda07fcad85c27362e54  nbfc-n14-control/patches/coolercontrold-producer-provenance.patch
+6043f4d9de74bf39b18761a8c8705cf219f2f3a6110b1f48fc593a43827980f5  nbfc-n14-control/patches/custom-device-producer-provenance.patch
+82390cd38fdc198afe88e1cc7ffcd04e55b523ecb56377c6117feadd79ef0ff5  nbfc-n14-control/build-verification/daemon-target/release/coolercontrold
+4c0d88d20dfcd1b7ab49050b7c5d424bbd45e0667cf47c17c626a0022c11e9c9  nbfc-n14-control/build-verification/plugin-target/release/custom-device

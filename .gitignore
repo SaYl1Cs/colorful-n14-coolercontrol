@@ -1,3 +1,4 @@
+# Python environments and generated output.
 __pycache__/
 *.py[cod]
 .venv/
@@ -5,3 +6,31 @@ __pycache__/
 *.zip
 runtime/
 test-results.txt
+/build/
+/dist/
+target/
+node_modules/
+*.o
+*.a
+*.so
+*.so.*
+
+# Local authorization, private bindings, snapshots and exported conversations.
+.env
+.env.*
+!.env.example
+coolercontrol-token.json
+profile-bindings.json
+*.pem
+*.key
+*.p12
+*.pfx
+/credentials/
+/secrets/
+/backups/
+roo_task_*.md
+
+# Only the directory's own ignore policy is public; never publish build receipts,
+# upstream worktrees, logs, binaries or local diagnostic snapshots.
+/build-verification/*
+!/build-verification/.gitignore

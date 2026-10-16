@@ -1,5 +1,6 @@
 """Offline GTK widget smoke tests; no fan/service code, no automatic file saves."""
 from pathlib import Path
+import os
 import sys
 import unittest
 from unittest.mock import Mock, patch
@@ -13,12 +14,18 @@ from curves import load_curves
 class GtkWidgetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            raise unittest.SkipTest('No graphical display in this environment')
         try:
             import gtk_editor
         except (ImportError, ValueError) as exc:
             raise unittest.SkipTest(f"GTK not available: {exc}") from exc
         cls.module = gtk_editor
-        if not gtk_editor.Gtk.init_check():
+        initialized = gtk_editor.Gtk.init_check()
+        # GTK3 GI returns (success, argv); GTK4 returns a bool.
+        if isinstance(initialized, tuple):
+            initialized = initialized[0]
+        if not initialized:
             raise unittest.SkipTest("No graphical display for GTK widget smoke tests")
 
     def setUp(self):

@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Low-overhead CPU sampling and runtime-PM-aware NVIDIA sampling.
+"""Read-only EC sampler for the Colorful N14 CPU and GPU inputs.
 
-No NVIDIA driver calls in observed suspended/transition/unknown states. NVML
-is initialized only for an active sample and shut down before the next sleep.
-Sysfs checks and NVML calls are not atomic; see README for the strict no-query
-mode and the limitation of userspace runtime-PM checks.
+Only EC CPU 0x56 and GPU 0x58 are read.  GPU temperature is present only when
+runtime PM is ``active`` and PCI power is ``D0``.  A suspended/``D3cold`` GPU
+has no temperature value; it is never replaced with the CPU temperature.
+
+The sampler owns a process session and a monotonically increasing sample ID.
+Its generation changes when the observed mode enters a different state
+(active, suspended, or error).  The same metadata is attached to the CPU and
+GPU values from one observation so the JSON temperature command is an atomic
+value/provenance pair from the consumer's point of view.
 """
 from __future__ import annotations
 
-import ctypes
 import fcntl
 import json
 import os
@@ -18,70 +22,19 @@ import stat
 import sys
 import tempfile
 import threading
+import time
+import uuid
 
-from thermal_state import RUNTIME_DIR, boottime, valid_temp, notify_ready
+from thermal_state import RUNTIME_DIR, boottime, notify_ready
 
 POLL_SECONDS = 1.0
-GPU_POLL_SECONDS = 5.0
-COOLDOWN_SECONDS = 15.0
-MAX_TEMP_MILLIC = 120000
-NVML_TEMPERATURE_GPU = 0
-
-
-class Nvml:
-    """Lazy library loading; no enumeration and no persistent driver session."""
-
-    def __init__(self):
-        self.lib = ctypes.CDLL('libnvidia-ml.so.1')
-        signatures = {
-            'nvmlInitWithFlags': ([ctypes.c_uint], ctypes.c_int),
-            'nvmlShutdown': ([], ctypes.c_int),
-            'nvmlDeviceGetHandleByPciBusId_v2':
-                ([ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)], ctypes.c_int),
-            'nvmlDeviceGetTemperature':
-                ([ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)], ctypes.c_int),
-            'nvmlErrorString': ([ctypes.c_int], ctypes.c_char_p),
-        }
-        for name, (args, result) in signatures.items():
-            function = getattr(self.lib, name)
-            function.argtypes, function.restype = args, result
-        self._initialized = False
-
-    def _check(self, code, operation):
-        if code:
-            detail = self.lib.nvmlErrorString(code)
-            raise RuntimeError(f'{operation}: {detail!r} ({code})')
-
-    def start(self):
-        # The no-attach flag cannot resolve a PCI handle on this driver. This
-        # function is only reached after runtime_status confirmed active.
-        self._check(self.lib.nvmlInitWithFlags(0), 'NVML init')
-        self._initialized = True
-
-    def close(self):
-        if self._initialized:
-            self._initialized = False
-            self._check(self.lib.nvmlShutdown(), 'NVML shutdown')
-
-    def gpu_temperature_millic(self, device=None):
-        device = discover_gpu() if device is None else device
-        handle = ctypes.c_void_p()
-        self._check(self.lib.nvmlDeviceGetHandleByPciBusId_v2(
-            device.name.encode('ascii'), ctypes.byref(handle)), 'GPU handle')
-        # Recheck immediately before the temperature call as well.
-        if runtime_status(device) != 'active':
-            raise RuntimeError('GPU is no longer active')
-        temperature = ctypes.c_uint()
-        self._check(self.lib.nvmlDeviceGetTemperature(
-            handle, NVML_TEMPERATURE_GPU, ctypes.byref(temperature)), 'GPU temperature')
-        value = temperature.value * 1000
-        if not valid_temp(value):
-            raise ValueError('invalid GPU temperature')
-        return value
+EC_IO = Path('/sys/kernel/debug/ec/ec0/io')
+EC_CPU_TEMP = 0x56
+EC_GPU_TEMP = 0x58
 
 
 def discover_gpu(root=Path('/sys/bus/pci/devices')):
-    # Only sysfs metadata: no NVIDIA ioctls, CUDA, tools or GPU enumeration.
+    """Find the one NVIDIA display function using sysfs metadata only."""
     devices = []
     for device in root.iterdir():
         try:
@@ -95,80 +48,87 @@ def discover_gpu(root=Path('/sys/bus/pci/devices')):
     return devices[0]
 
 
-def runtime_status(device):
-    return (device / 'power/runtime_status').read_text(encoding='ascii').strip()
+def power_state(device):
+    """Read runtime and PCI PM twice; this is not an atomic kernel lease."""
+    def read():
+        return ((device / 'power/runtime_status').read_text(encoding='ascii').strip(),
+                (device / 'power_state').read_text(encoding='ascii').strip())
+    first = read()
+    if read() != first:
+        raise RuntimeError('GPU power state changed during observation')
+    if first not in (('suspended', 'D3cold'), ('active', 'D0')):
+        raise RuntimeError(f'GPU power state unconfirmed: {first!r}')
+    return first
 
 
-class CpuSensor:
-    def __init__(self, root=Path('/sys/class/hwmon')):
-        self.root, self.paths = root, []
+class EcSensor:
+    def __init__(self, path=EC_IO):
+        self.path = Path(path)
+
+    def read(self, offset):
+        if type(offset) is not int or offset not in (EC_CPU_TEMP, EC_GPU_TEMP):
+            raise ValueError('EC temperature offset is not whitelisted')
+        # Open afresh so unavailable debugfs/resume failures can recover.  No
+        # EC scans, index-port writes, or write_support requirement are used.
+        fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            value = os.pread(fd, 1, offset)
+        finally:
+            os.close(fd)
+        if len(value) != 1 or not 0 < value[0] < 120:
+            raise ValueError(f'EC temperature at 0x{offset:02x} is invalid: {value.hex()}')
+        return value[0] * 1000
+
+
+class CpuEcSensor:
+    def __init__(self, ec):
+        self.ec = ec
 
     def read(self):
-        if not self.paths:
-            for hwmon in self.root.glob('hwmon*'):
-                if (hwmon / 'name').read_text().strip() == 'coretemp':
-                    self.paths.extend(sorted(hwmon.glob('temp*_input')))
-        try:
-            values = [int(path.read_text(encoding='ascii')) for path in self.paths]
-            if not values or not all(valid_temp(value) for value in values):
-                raise ValueError('coretemp unavailable or invalid')
-            return max(values)
-        except (OSError, ValueError):
-            self.paths = []  # Rediscover after resume/hwmon renumbering.
-            raise
+        return self.ec.read(EC_CPU_TEMP)
 
 
 def cpu_temperature_millic():
-    # Compatibility with the separate supervised manual test, not the daemon.
-    return CpuSensor().read()
+    # Compatibility for supervised manual tools, with the same platform guard.
+    from prepare import check_platform
+    check_platform()
+    return CpuEcSensor(EcSensor()).read()
 
 
-class GpuSensor:
-    def __init__(self, device, factory=Nvml, poll=True):
-        self.device, self.factory, self.poll = device, factory, poll
-        self.nvml = None
-        self.last_value = self.last_at = None
-        self.previous_state = None
-        self.next_query = 0.0
-        self.suspended_since = None
+class GpuEcSensor:
+    def __init__(self, ec, device=None):
+        self.ec = ec
+        self.device = device
 
-    def read(self, cpu, now):
-        state = runtime_status(self.device)
-        if state == 'suspended':
-            if self.suspended_since is None:
-                self.suspended_since = now
-            self.previous_state = state
-            # Not a GPU measurement: explicitly labelled cooling-curve input.
-            demand = cpu
-            if (valid_temp(cpu) and self.last_value is not None
-                    and 0 <= now - self.last_at <= COOLDOWN_SECONDS):
-                demand = max(cpu, self.last_value)
-            return {'gpu_state': state, 'gpu_temp': None,
-                    'gpu_input': demand, 'gpu_sampled_at': None}
-        self.suspended_since = None
-        if state != 'active':
-            self.previous_state = state
-            raise RuntimeError(f'GPU runtime state is {state!r}; not querying driver')
-        if not self.poll:
-            raise RuntimeError('strict no-query mode: active GPU temperature unavailable')
-        if self.previous_state != 'active' or now >= self.next_query:
-            self.last_value = self.last_at = None
-            # The second gate precedes even lazy library loading/init.
-            if runtime_status(self.device) != 'active':
-                raise RuntimeError('GPU changed state before NVML init')
-            if self.nvml is None:
-                self.nvml = self.factory()
-            try:
-                self.nvml.start()
-                self.last_value = self.nvml.gpu_temperature_millic(self.device)
-            finally:
-                # Even an exception must release the GPU before waiting.
-                self.nvml.close()
-            self.last_at = boottime()
-            self.next_query = self.last_at + GPU_POLL_SECONDS
-        self.previous_state = state
-        return {'gpu_state': state, 'gpu_temp': self.last_value,
-                'gpu_input': self.last_value, 'gpu_sampled_at': self.last_at}
+    def read(self, now):
+        if self.device is None:
+            self.device = discover_gpu()
+        before = power_state(self.device)
+        value = self.ec.read(EC_GPU_TEMP) if before == ('active', 'D0') else None
+        if power_state(self.device) != before:
+            raise RuntimeError('GPU changed power state during EC sample')
+        return {'gpu_state': before[0], 'gpu_power_state': before[1],
+                'gpu_temp': value, 'gpu_sampled_at': now if value is not None else None}
+
+
+class SamplerState:
+    """Process-local identity and mode generation for EC observations."""
+    def __init__(self, session=None):
+        self.session = session or str(uuid.uuid4())
+        self.generation = 0
+        self.sample_id = 0
+        self.mode = None
+
+    def begin(self, mode):
+        if mode != self.mode:
+            self.generation += 1
+            self.mode = mode
+        self.sample_id += 1
+        return self.generation, self.sample_id
+
+
+def _unix_ms():
+    return time.time_ns() // 1_000_000
 
 
 def ensure_runtime_dir():
@@ -183,52 +143,87 @@ def write_snapshot(data):
     fd, temporary = tempfile.mkstemp(prefix='.temperatures.', dir=RUNTIME_DIR)
     try:
         with os.fdopen(fd, 'w', encoding='ascii') as stream:
-            json.dump(data, stream, allow_nan=False)
+            json.dump(data, stream, allow_nan=False, separators=(',', ':'))
             stream.write('\n')
-        # /run is volatile; fsync buys no persistence. Atomic rename is enough.
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, RUNTIME_DIR / 'temperatures.json')
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
-def sample(cpu, gpu):
+def sample(cpu, gpu, state=None):
+    """Take one paired observation without retaining stale sensor values.
+
+    ``sampled_at`` is the beginning of I/O, so a blocked EC read ages the
+    previous snapshot rather than rejuvenating it.  A caller can inject a
+    ``SamplerState`` in offline tests to exercise mode generations.
+    """
+    state = SamplerState() if state is None else state
+    sampled_at = boottime()
+    sampled_at_monotonic_ns = int(sampled_at * 1_000_000_000)
+    sampled_at_unix_ms = _unix_ms()
     errors = []
     try:
         cpu_value = cpu.read()
     except (OSError, ValueError, RuntimeError) as exc:
         cpu_value = None
-        errors.append(f'CPU: {exc}')
-    now = boottime()
+        errors.append(f'CPU EC read: {exc}')
     try:
-        gpu_data = gpu.read(cpu_value, now)
-    except (OSError, ValueError, RuntimeError, AttributeError) as exc:
-        gpu_data = {'gpu_state': 'error', 'gpu_temp': None,
-                    'gpu_input': cpu_value, 'gpu_sampled_at': None}
-        errors.append(f'GPU: {exc}')
-    return dict(gpu_data, cpu_temp=cpu_value, sampled_at=now, errors=errors)
+        gpu_data = gpu.read(sampled_at)
+    except (OSError, ValueError, RuntimeError) as exc:
+        gpu_data = {'gpu_state': 'error', 'gpu_power_state': None,
+                    'gpu_temp': None, 'gpu_sampled_at': None}
+        errors.append(f'GPU EC/PM read: {exc}')
+
+    gpu_state = gpu_data.get('gpu_state')
+    mode = gpu_state if not errors and gpu_state in (
+        'active', 'suspended') else 'error'
+    generation, sample_id = state.begin(mode)
+    common = dict(session=state.session, generation=generation, sample_id=sample_id,
+                  sampled_at_unix_ms=sampled_at_unix_ms,
+                  sampled_at_monotonic_ns=sampled_at_monotonic_ns)
+    cpu_sample = None
+    if cpu_value is not None:
+        cpu_sample = dict(common, sensor='cpu', power_state=mode)
+    gpu_sample = None
+    if gpu_data.get('gpu_temp') is not None:
+        gpu_sample = dict(common, sensor='gpu', power_state=mode)
+
+    return dict(gpu_data, schema_version=2, source='ec0/io',
+                cpu_temp=cpu_value, sampled_at=sampled_at,
+                sampled_at_unix_ms=sampled_at_unix_ms,
+                sampled_at_monotonic_ns=sampled_at_monotonic_ns,
+                sampler_session=state.session, sampler_generation=generation,
+                sample_id=sample_id, cpu_sample=cpu_sample, gpu_sample=gpu_sample,
+                errors=errors)
 
 
 def main():
     if os.geteuid() != 0:
         print('colorful-n14 sensors: run as root', file=sys.stderr)
         return 1
+    # DMI, BIOS, SMBIOS EC version and exact DSDT checks precede any EC read.
+    from prepare import check_platform
+    check_platform()
     ensure_runtime_dir()
     lock_fd = os.open(RUNTIME_DIR / 'sensors.lock',
                       os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        cpu = CpuSensor()
-        gpu = GpuSensor(discover_gpu(), poll=os.environ.get('N14_GPU_POLL', 'never') != 'never')
+        ec = EcSensor()
+        cpu, gpu = CpuEcSensor(ec), GpuEcSensor(ec)
+        state = SamplerState()
         stop = threading.Event()
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, lambda *_: stop.set())
         last_errors = None
         ready = False
         while not stop.is_set():
-            data = sample(cpu, gpu)
+            data = sample(cpu, gpu, state)
             write_snapshot(data)
             if not ready:
-                notify_ready()
+                notify_ready()  # Ready to publish, NOT a claim of valid sensors.
                 ready = True
             if data['errors'] != last_errors:
                 if data['errors']:

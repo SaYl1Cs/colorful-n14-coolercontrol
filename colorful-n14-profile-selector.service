@@ -1,0 +1,24 @@
+[Unit]
+Description=Colorful N14 authenticated CoolerControl EC profile selector
+Requires=colorful-n14-adapter.service colorful-n14-sensors.service coolercontrold.service
+After=colorful-n14-adapter.service colorful-n14-sensors.service coolercontrold.service
+PartOf=colorful-n14-adapter.service colorful-n14-sensors.service coolercontrold.service
+Conflicts=nbfc_service.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -B /usr/local/share/colorful-n14-control/profile_selector_service.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+UMask=0077
+User=root
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/colorful-n14-control/coolercontrol-token.json /etc/colorful-n14-control/profile-bindings.json
+ReadWritePaths=/run/colorful-n14-control
+
+[Install]
+WantedBy=multi-user.target

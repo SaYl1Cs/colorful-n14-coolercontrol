@@ -1,0 +1,4 @@
+# Unified patches require a single-space prefix on empty context lines.
+# Preserve the checksum-verified patch bytes; validate added source whitespace
+# separately with git apply --check --whitespace=error-all on clean base trees.
+patches/*.patch whitespace=-blank-at-eol

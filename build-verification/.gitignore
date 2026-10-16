@@ -1,0 +1,4 @@
+# Local build artifacts, cloned verification workdirs, logs and binaries.
+# Reproducible source changes live in ../patches, not in this directory.
+*
+!.gitignore

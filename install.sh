@@ -1,147 +1,193 @@
 #!/usr/bin/env bash
-# Install the guarded Colorful N14 CoolerControl integration.
-set -euo pipefail
+# Transactional upgrade only. No package installs, reboot, module unload or global EC write-policy change.
+set -Eeuo pipefail
 umask 077
+export PYTHONDONTWRITEBYTECODE=1
 
-if [[ ${EUID} -ne 0 ]]; then
-  echo 'Run this installer with sudo: sudo ./install.sh' >&2
-  exit 1
-fi
-
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+fail() { echo "STOP: preflight refusal: $*; installed cooling has not been changed." >&2; exit 1; }
+# Builtins only until dependencies/root have been checked: safe in incomplete offline environments.
+for command in python3 systemctl timeout flock cp; do
+  command -v "$command" >/dev/null || fail "required command is missing: $command"
+done
+[[ $EUID == 0 ]] || fail 'root required; run sudo bash install.sh'
+SOURCE_SCRIPT=${BASH_SOURCE[0]}
+[[ $SOURCE_SCRIPT == */* ]] || SOURCE_SCRIPT=./$SOURCE_SCRIPT
+ROOT_DIR=$(cd -- "${SOURCE_SCRIPT%/*}" && pwd)
 PREFIX=/usr/local/share/colorful-n14-control
-ADAPTER_TARGET=/usr/local/libexec/colorful-n14-coolercontrol
-PLUGIN_DIR=/etc/coolercontrol/plugins/custom-device
-BACKUP_ROOT=/var/backups/colorful-n14-control/$(date +%Y%m%d-%H%M%S)
+CLIENT=/usr/local/libexec/colorful-n14-coolercontrol
 PREPARE_UNIT=colorful-n14-nbfc-prepare.service
 SENSORS_UNIT=colorful-n14-sensors.service
 ADAPTER_UNIT=colorful-n14-adapter.service
-DROPIN_DIR=/etc/systemd/system/coolercontrold.service.d
-LEGACY_DROPIN="$DROPIN_DIR/n14.conf"
+SELECTOR_UNIT=colorful-n14-profile-selector.service
+PLUGIN_UNIT=cc-plugin-custom-device.service
+PREREQUISITE_UNIT=colorful-n14-ec-readonly.service
 
-fail() {
-  echo "STOP: $*" >&2
-  exit 1
-}
+ctl() { timeout --kill-after=2s 25s systemctl "$@"; }
 
-for command in python3 systemctl install modprobe cc flock; do
-  command -v "$command" >/dev/null || fail "required command is missing: $command"
-done
-
-if ! command -v pacman >/dev/null; then
-  fail 'this installer targets Arch-based systems and requires pacman'
-fi
-
-if ! command -v coolercontrold >/dev/null || [[ ! -d "$PLUGIN_DIR" ]]; then
-  cat >&2 <<'EOF'
-CoolerControl with the custom-device plugin is not installed.
-Install it first using your distribution's packages, for example:
-  sudo pacman -S --needed coolercontrol
-Then run this installer again.
-EOF
-  exit 1
-fi
-
-if systemctl is-active --quiet nbfc_service.service || pgrep -x nbfc_service >/dev/null 2>&1; then
-  fail 'NBFC is active; stop it before installing the CoolerControl backend'
-fi
-
-[[ -f "$ROOT_DIR/coolercontrol_adapter.py" ]] || fail 'coolercontrol_adapter.py is missing'
-[[ -f "$ROOT_DIR/coolercontrol-config.json" ]] || fail 'coolercontrol-config.json is missing'
-python3 -m py_compile \
-  "$ROOT_DIR/prepare.py" \
-  "$ROOT_DIR/prepare-autostart.py" \
-  "$ROOT_DIR/sensor_cache.py" \
-  "$ROOT_DIR/coolercontrol_adapter.py"
-python3 -m json.tool "$ROOT_DIR/coolercontrol-config.json" >/dev/null
-python3 "$ROOT_DIR/prepare.py" check >/dev/null || fail 'this machine does not match the pinned N14 24 BIOS/DSDT checks'
-exec 9>/run/colorful-n14-install.lock
-flock -n 9 || fail 'another installer is running'
-STAGING=$(mktemp -d)
-trap 'rm -rf -- "$STAGING"' EXIT
-cc -std=c11 -O2 -Wall -Wextra -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-  "$ROOT_DIR/src/adapter_client.c" -o "$STAGING/adapter-client"
-# Only replace our own device definition. Preserve other custom devices/settings.
-python3 - "$ROOT_DIR/coolercontrol-config.json" "$PLUGIN_DIR/config.json" "$STAGING/config.json" <<'PY'
-import json, pathlib, sys
-source, target, output = map(pathlib.Path, sys.argv[1:])
-ours = json.loads(source.read_text())['devices'][0]
-data = json.loads(target.read_text()) if target.exists() else {'devices': []}
-data['devices'] = [ours if d.get('id') == ours['id'] else d for d in data['devices']]
-if not any(d.get('id') == ours['id'] for d in data['devices']):
-    data['devices'].append(ours)
-output.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
-PY
-
-backup_path() {
-  local path=$1
-  if [[ -e "$path" || -L "$path" ]]; then
-    mkdir -p "$BACKUP_ROOT$(dirname -- "$path")"
-    cp -a --no-dereference "$path" "$BACKUP_ROOT$path"
+# Shared by the ERR trap, external timer, and deterministic manual rollback.
+# Backup code is self-contained and is never imported from the installed prefix.
+recover_backup() {
+  local backup=$1 units unit
+  local tx="$backup/recovery/install_transaction.py"
+  python3 -B "$tx" validate "$backup" || return 1
+  units=$(python3 -B "$tx" units "$backup") || return 1
+  # Stop selector/daemon/plugin before reset so no producer can queue a lower duty.
+  # Absent old selector is expected on first upgrade; a loaded unit must stop cleanly.
+  if [[ $(ctl show "$SELECTOR_UNIT" -p LoadState --value) != not-found ]]; then
+    ctl stop "$SELECTOR_UNIT" || return 1
   fi
+  ctl stop coolercontrold.service || return 1
+  if [[ $(ctl show "$PLUGIN_UNIT" -p LoadState --value) != not-found ]]; then
+    ctl stop "$PLUGIN_UNIT" || return 1
+  fi
+  if ctl is-active --quiet "$ADAPTER_UNIT"; then
+    timeout --kill-after=1s 5s "$CLIENT" reset >/dev/null || return 1
+  fi
+  ctl stop "$ADAPTER_UNIT" || return 1
+  ctl stop "$SENSORS_UNIT" || return 1
+  ctl stop "$PREPARE_UNIT" || return 1
+  if [[ $(ctl show "$PREREQUISITE_UNIT" -p LoadState --value) != not-found ]]; then
+    ctl stop "$PREREQUISITE_UNIT" || return 1
+  fi
+  python3 -B "$tx" restore "$backup" || return 1
+  ctl daemon-reload || return 1
+  # Only originally active units; no enable/disable or global target changes.
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    ctl start "$unit" || return 1
+  done <<< "$units"
+  printf 'restored\n' > "$backup/result"
+  echo "Previous installation restored; backup retained: $backup" >&2
 }
 
-mkdir -p -m 0700 "$BACKUP_ROOT"
-backup_path "$PREFIX"
-backup_path /etc/coolercontrol/config.toml
-backup_path /etc/coolercontrol/config-ui.json
-backup_path "$ADAPTER_TARGET"
-backup_path "/etc/systemd/system/$ADAPTER_UNIT"
-backup_path "$PLUGIN_DIR/config.json"
-backup_path "/etc/systemd/system/$PREPARE_UNIT"
-backup_path "/etc/systemd/system/$SENSORS_UNIT"
-backup_path "$DROPIN_DIR/colorful-n14-control.conf"
-backup_path "$LEGACY_DROPIN"
-backup_path "/etc/modules-load.d/colorful-n14-control.conf"
-
-# Stop control first while the OLD backend and caches still work. Its reset
-# requests full fans. Do not copy a partial backend underneath live processes.
-systemctl stop coolercontrold.service
-if systemctl is-active --quiet "$ADAPTER_UNIT"; then
-  systemctl stop "$ADAPTER_UNIT"
-fi
-systemctl stop "$SENSORS_UNIT" || true
-
-# Older revisions installed an invalid n14.conf with Conflicts in [Service].
-# Remove only that known integration file; preserve unrelated administrator drop-ins.
-if [[ -f "$LEGACY_DROPIN" ]] && grep -q 'colorful-n14-nbfc-prepare.service' "$LEGACY_DROPIN"; then
-  rm -f "$LEGACY_DROPIN"
+# --restore is usable even after commit. --recover is the automatic timer path
+# and does not undo a successfully committed or already rolled-back transaction.
+if [[ ${1:-} == --restore || ${1:-} == --recover ]]; then
+  ACTION=$1
+  BACKUP_ROOT=${2:?backup directory required}
+  [[ $BACKUP_ROOT == /var/backups/colorful-n14-control/* && -d $BACKUP_ROOT/recovery ]] || exit 1
+  if [[ $ACTION == --recover ]]; then
+    [[ ! -f $BACKUP_ROOT/result ]] || exit 0
+    # Verify PID start-time before signalling: never kill a recycled PID.
+    python3 -B "$BACKUP_ROOT/recovery/install_transaction.py" interrupt "$BACKUP_ROOT"
+  fi
+  exec 9>/run/colorful-n14-install.lock
+  flock -w 90 9 || { echo 'Recovery cannot acquire installer lock; no files restored under live installer.' >&2; exit 1; }
+  if [[ $ACTION == --recover && -f $BACKUP_ROOT/result ]]; then exit 0; fi
+  recover_backup "$BACKUP_ROOT"
+  exit $?
 fi
 
-install -d -m 0755 "$PREFIX/configs" "$PREFIX/src" /usr/local/libexec
-install -m 0644 "$ROOT_DIR/build_profile.py" "$PREFIX/build_profile.py"
-install -m 0644 "$ROOT_DIR/curves.py" "$PREFIX/curves.py"
-install -m 0644 "$ROOT_DIR/curves.json" "$PREFIX/curves.json"
-install -m 0644 "$ROOT_DIR/prepare.py" "$PREFIX/prepare.py"
-install -m 0755 "$ROOT_DIR/prepare-autostart.py" "$PREFIX/prepare-autostart.py"
-install -m 0755 "$ROOT_DIR/sensor_cache.py" "$PREFIX/sensor_cache.py"
-install -m 0644 "$ROOT_DIR/configs/Colorful N14 24 - Temperature Curves - GPU Command Readback.json" \
-  "$PREFIX/configs/Colorful N14 24 - Temperature Curves - GPU Command Readback.json"
-install -m 0644 "$ROOT_DIR/src/transport.lua" "$PREFIX/src/transport.lua"
-for module in coolercontrol_adapter.py adapter_server.py thermal_state.py; do
-  install -m 0644 "$ROOT_DIR/$module" "$PREFIX/$module"
+for command in mktemp rm cat cc ldd modprobe lua5.4 systemd-run; do
+  command -v "$command" >/dev/null || fail "required deployment command is missing: $command"
 done
-install -m 0755 "$STAGING/adapter-client" "$ADAPTER_TARGET.new"
-mv -f "$ADAPTER_TARGET.new" "$ADAPTER_TARGET"
-install -d -m 0755 "$PLUGIN_DIR"
-install -m 0600 "$STAGING/config.json" "$PLUGIN_DIR/config.json"
-install -m 0644 "$ROOT_DIR/colorful-n14-adapter.service" "/etc/systemd/system/$ADAPTER_UNIT"
-install -m 0644 "$ROOT_DIR/colorful-n14-nbfc-prepare.service" "/etc/systemd/system/$PREPARE_UNIT"
-install -m 0644 "$ROOT_DIR/colorful-n14-sensors.service" "/etc/systemd/system/$SENSORS_UNIT"
-install -d -m 0755 "$DROPIN_DIR" /etc/modules-load.d
-install -m 0644 "$ROOT_DIR/coolercontrold-n14.conf" "$DROPIN_DIR/colorful-n14-control.conf"
-printf '%s\n' acpi_call > /etc/modules-load.d/colorful-n14-control.conf
+MODE=install
+PLUGIN_ARGS=()
+while (($#)); do
+  case $1 in
+    --preflight) MODE=preflight; shift ;;
+    --plugin-dir) [[ $# -ge 2 ]] || fail '--plugin-dir requires an absolute custom-device directory'; PLUGIN_ARGS=(--plugin-dir "$2"); shift 2 ;;
+    *) fail "unknown option: $1" ;;
+  esac
+done
+command -v systemd-run >/dev/null || fail 'systemd-run is required for independent timed recovery'
+python3 -B -c 'import tomllib; import sys; assert sys.version_info >= (3, 11)' || fail 'Python 3.11+ required'
+# These queries and checks do not load modules, sample EC bytes or change flags.
+modprobe --show-depends acpi_call >/dev/null || fail 'acpi_call module unavailable for preparation on boot'
+modprobe --show-depends ec_sys >/dev/null || fail 'ec_sys module unavailable on boot'
+exec 9>/run/colorful-n14-install.lock
+flock -n 9 || fail 'another installer/recovery is running'
+STAGING=$(mktemp -d /run/colorful-n14-install.XXXXXXXX)
+trap 'rm -rf -- "$STAGING"' EXIT
+python3 -B "$ROOT_DIR/install_transaction.py" stage "$STAGING" --source "$ROOT_DIR" "${PLUGIN_ARGS[@]}" || fail 'release/dependency/path staging failed'
+SOURCE="$STAGING/source"
+TX="$SOURCE/install_transaction.py"
+# Run the staged, hermetic offline suite; no live API/EC/service mutation in tests.
+PYTHONPATH="$SOURCE:$SOURCE/tests" python3 -B -m unittest discover -s "$SOURCE/tests" -v >"$STAGING/tests.log" 2>&1 || {
+  cat "$STAGING/tests.log" >&2
+  fail 'offline regression suite failed'
+}
+python3 -B "$SOURCE/prepare.py" check >/dev/null || fail 'pinned N14 BIOS/DSDT identity check failed'
+python3 -B "$SOURCE/install_prerequisites.py" || fail 'mounted debugfs/read-only access/NBFC check failed'
+[[ -e /proc/acpi/call ]] || fail 'acpi_call must already be loaded for the running backend'
+# The capture validates root-owned 0700 token parent and root0600 credential,
+# authenticates to the LIVE OLD API, validates profiles, and prints IDs only.
+timeout --kill-after=1s 30s python3 -B "$SOURCE/capture_profile_bindings.py" >"$STAGING/profile-bindings.json" || fail 'authenticated live profile binding capture failed'
+timeout --kill-after=1s 30s python3 -B "$TX" check-bindings "$STAGING/profile-bindings.json" || fail 'live profile policy/poll-rate validation failed'
+cc -std=c11 -O2 -Wall -Wextra -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+  "$SOURCE/src/adapter_client.c" -o "$STAGING/adapter-client" || fail 'C client compilation failed'
+# No lower-duty requests occur during preflight. Never overwrite/enroll the token.
+if [[ $MODE == preflight ]]; then
+  echo 'Preflight passed: patched releases, dependencies, offline tests, identity, mounts, token and live bindings. No cooling services or installed files changed.'
+  exit 0
+fi
 
-systemctl daemon-reload
-systemctl enable "$PREPARE_UNIT" "$SENSORS_UNIT" "$ADAPTER_UNIT" >/dev/null
-systemctl restart "$PREPARE_UNIT"
-systemctl restart "$SENSORS_UNIT"
-systemctl start "$ADAPTER_UNIT"
-systemctl start coolercontrold.service
+BACKUP_ROOT=$(python3 -B -c 'import datetime,os; print("/var/backups/colorful-n14-control/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + str(os.getppid()))')
+python3 -B "$TX" snapshot "$BACKUP_ROOT" --source "$SOURCE" || fail 'complete backup failed'
+cp -- "$STAGING/tests.log" "$BACKUP_ROOT/preflight-tests.log"
+python3 -B "$TX" owner "$BACKUP_ROOT" --pid "$$"
+RECOVERY_UNIT="colorful-n14-recovery-${BACKUP_ROOT##*/}"
+printf '\nBackup: %s\nRollback: sudo bash %q --restore %q\n' "$BACKUP_ROOT" "$BACKUP_ROOT/recovery/install.sh" "$BACKUP_ROOT"
+TRANSACTION_STARTED=0
+rollback() {
+  local status=$?
+  trap - ERR INT TERM
+  set +e
+  if [[ $TRANSACTION_STARTED == 1 ]]; then
+    if recover_backup "$BACKUP_ROOT"; then
+      ctl stop "$RECOVERY_UNIT.timer" >/dev/null 2>&1
+    else
+      echo "STOP: rollback incomplete; recovery timer/backup retained: $BACKUP_ROOT" >&2
+    fi
+  else
+    # Timer creation/check failed before the first service stop. Do not leave
+    # a late timer to undo an installation that was never attempted.
+    printf 'not-started\n' > "$BACKUP_ROOT/result"
+    ctl stop "$RECOVERY_UNIT.timer" >/dev/null 2>&1
+  fi
+  exit "$((status == 0 ? 1 : status))"
+}
+trap rollback ERR
+trap 'false' INT TERM
+# Independent recovery is armed and checked BEFORE stopping cooling. FD 9 is
+# explicitly not inherited by the transient service. No persistent unit enable.
+systemd-run --quiet --unit="$RECOVERY_UNIT" --on-active=180s \
+  --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=300s \
+  /bin/bash "$BACKUP_ROOT/recovery/install.sh" --recover "$BACKUP_ROOT" 9>&-
+ctl is-active --quiet "$RECOVERY_UNIT.timer"
+TRANSACTION_STARTED=1
 
-printf '\nInstalled Colorful N14 CoolerControl integration.\n'
-printf 'Backup: %s\n' "$BACKUP_ROOT"
-printf 'Sensor cache: %s\n' "$PREFIX/sensor_cache.py"
-printf 'Check status with: systemctl --no-pager status %s %s %s coolercontrold.service\n' "$PREPARE_UNIT" "$SENSORS_UNIT" "$ADAPTER_UNIT"
-printf '%s\n' 'In CoolerControl, create CPU and GPU graph profiles, then a Maximum mix profile and assign it to Both Fans.'
-printf '%s\n' 'The UI 0% command maps to raw 1; raw 0 is intentionally never written.'
+if [[ $(ctl show "$SELECTOR_UNIT" -p LoadState --value) != not-found ]]; then
+  ctl stop "$SELECTOR_UNIT"
+fi
+ctl stop coolercontrold.service
+if [[ $(ctl show "$PLUGIN_UNIT" -p LoadState --value) != not-found ]]; then
+  ctl stop "$PLUGIN_UNIT"
+fi
+# Confirm OLD backend full reset while OLD sensors and adapter are still alive.
+# Adapter shutdown repeats full reset before sensors are stopped.
+timeout --kill-after=1s 5s "$CLIENT" reset >/dev/null
+ctl stop "$ADAPTER_UNIT"
+ctl stop "$SENSORS_UNIT"
+ctl stop "$PREPARE_UNIT"
+timeout --kill-after=2s 60s python3 -B "$TX" apply "$STAGING" --backup "$BACKUP_ROOT"
+ctl daemon-reload
+ctl start "$PREPARE_UNIT"
+ctl start "$SENSORS_UNIT"
+ctl start "$ADAPTER_UNIT"
+# CoolerControl creates and starts the managed plugin unit during startup.
+# It removes that unit during shutdown; do not start it before the daemon.
+# The cooler drop-in Wants selector; its After=coolercontrold ordering avoids a cycle.
+ctl start coolercontrold.service
+ctl is-active --quiet "$PLUGIN_UNIT"
+ctl start "$SELECTOR_UNIT"
+# 58s + 1s kill grace is strictly below the requested 60s wall-clock health cap.
+timeout --kill-after=1s 58s python3 -B "$PREFIX/install_transaction.py" health
+# Cancel timer before commit, then record success while holding the installer lock.
+ctl stop "$RECOVERY_UNIT.timer"
+printf 'committed\n' > "$BACKUP_ROOT/result"
+TRANSACTION_STARTED=0
+trap - ERR INT TERM
+printf '\nInstalled EC release; global EC write policy preserved. No reboot required.\n'
+printf 'Backup and deterministic rollback: sudo bash %q --restore %q\n' "$BACKUP_ROOT/recovery/install.sh" "$BACKUP_ROOT"
+printf '%s\n' 'Stable device/profile IDs retained. CPU-only while GPU sleeps; Maximum CPU/GPU while awake. Awaiting provenance retains full duty.'

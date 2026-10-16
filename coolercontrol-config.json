@@ -10,7 +10,7 @@
           "commands": {
             "get_rpm": "/usr/local/libexec/colorful-n14-coolercontrol get-rpm",
             "get_duty": "/usr/local/libexec/colorful-n14-coolercontrol get-duty",
-            "set_duty": "/usr/local/libexec/colorful-n14-coolercontrol set-duty '{duty}'",
+            "set_duty_provenance": "/usr/local/libexec/colorful-n14-coolercontrol set-duty-provenance",
             "enable_manual": "/usr/local/libexec/colorful-n14-coolercontrol enable",
             "reset": "/usr/local/libexec/colorful-n14-coolercontrol reset"
           }
@@ -19,13 +19,15 @@
       "temps": [
         {
           "id": "cpu_temp",
-          "label": "CPU Temperature",
-          "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-cpu"
+          "label": "CPU EC",
+          "provenance": true,
+          "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-cpu/json"
         },
         {
           "id": "gpu_temp",
-          "label": "GPU cooling input (CPU fallback while GPU sleeps)",
-          "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-gpu"
+          "label": "GPU EC (unavailable during sleep)",
+          "provenance": true,
+          "command": "/usr/local/libexec/colorful-n14-coolercontrol temp-gpu/json"
         }
       ]
     }

@@ -1,0 +1,356 @@
+diff --git a/proto/coolercontrol/device_service/v1/fixed_duty.proto b/proto/coolercontrol/device_service/v1/fixed_duty.proto
+index fe2a960b673cc05580aa4dbbf29595307d267f46..ae79c14a387cfe416870676f527242884061af35 100644
+--- a/proto/coolercontrol/device_service/v1/fixed_duty.proto
++++ b/proto/coolercontrol/device_service/v1/fixed_duty.proto
+@@ -6,6 +6,8 @@ message FixedDutyRequest {
+   string device_id = 1;
+   string channel_id = 2;
+   int32 duty = 3;
++  // Immutable producer label; empty means no calculation provenance.
++  string provenance_json = 4;
+ }
+ 
+ message FixedDutyResponse {}
+diff --git a/proto/coolercontrol/models/v1/status.proto b/proto/coolercontrol/models/v1/status.proto
+index 06f8c480af72cdd8911d5b0942801cc459c172aa..2423ff867f05f5c1777dc31bcfa8ebb668adf2ea 100644
+--- a/proto/coolercontrol/models/v1/status.proto
++++ b/proto/coolercontrol/models/v1/status.proto
+@@ -5,6 +5,8 @@ package coolercontrol.models.v1;
+ message Status {
+   // The Channel/Temp ID
+   string id = 1;
++  // Original sensor sample metadata; never synthesized by a receiver.
++  string sample_provenance_json = 6;
+ 
+   oneof metric {
+     // Temperature in C
+diff --git a/src/config.rs b/src/config.rs
+index bbb7b53e402b13c70438a892be00228759bab55d..8fee4a7fbbedd7d871e17cf4e9797e7377db2971 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -53,12 +53,16 @@ pub enum ChannelCommand {
+     GetRpm,
+     GetDuty,
+     SetDuty,
++    SetDutyProvenance,
+     EnableManual,
+     Reset,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct DeviceTemp {
++    /// Command returns {"temperature": Celsius, "sample": {...}} atomically.
++    #[serde(default)]
++    pub provenance: bool,
+     pub id: TempId,
+     pub label: String,
+     pub command: String,
+@@ -73,7 +77,10 @@ pub fn convert_to_devices(config: &CustomDevices) -> Result<Vec<Device>> {
+             .iter()
+             .cloned()
+             .map(|channel| {
+-                let is_controllable = channel.get_command(&ChannelCommand::SetDuty).is_some();
++                let is_controllable = channel.get_command(&ChannelCommand::SetDuty).is_some()
++                    || channel
++                        .get_command(&ChannelCommand::SetDutyProvenance)
++                        .is_some();
+                 (
+                     channel.id,
+                     models::v1::ChannelInfo {
+diff --git a/src/executor.rs b/src/executor.rs
+index b18a5c43aae9c831e2af2dc6067268e452dee2ce..df184cf2b1ac628f0846b12001d3cb43ef4494f4 100644
+--- a/src/executor.rs
++++ b/src/executor.rs
+@@ -22,6 +22,7 @@ pub async fn poll_device_status(device: &CustomDevice) -> Vec<models::v1::Status
+         if rpm.is_some() || duty.is_some() {
+             statuses.push(models::v1::Status {
+                 id: channel.id.to_string(),
++                sample_provenance_json: String::new(),
+                 metric: Some(models::v1::status::Metric::Speed(
+                     models::v1::status::FanSpeed { duty, rpm },
+                 )),
+@@ -29,6 +30,20 @@ pub async fn poll_device_status(device: &CustomDevice) -> Vec<models::v1::Status
+         }
+     }
+     for temp in &device.temps {
++        if temp.provenance {
++            if let Some(out) = run_shell_command(&temp.command).await {
++                if let Ok((temperature, sample)) = parse_sample(&out) {
++                    statuses.push(models::v1::Status {
++                        id: temp.id.clone(),
++                        metric: Some(models::v1::status::Metric::Temp(temperature)),
++                        sample_provenance_json: sample,
++                    });
++                } else {
++                    warn!("Invalid provenance sample for {}", temp.id);
++                }
++            }
++            continue;
++        }
+         if let Some(value) = run_shell_command(&temp.command)
+             .await
+             .and_then(|out| out.trim().parse::<f64>().ok())
+@@ -41,6 +56,7 @@ pub async fn poll_device_status(device: &CustomDevice) -> Vec<models::v1::Status
+             };
+             statuses.push(models::v1::Status {
+                 id: temp.id.to_string(),
++                sample_provenance_json: String::new(),
+                 metric: Some(models::v1::status::Metric::Temp(temp_c)),
+             });
+         }
+@@ -62,3 +78,125 @@ pub async fn run_shell_command(cmd: &str) -> Option<String> {
+         }
+     }
+ }
++
++/// `cmd` is trusted configuration, but duty/provenance are data, never shell code.
++/// The configured command receives exactly two appended arguments. Use a simple
++/// executable plus fixed arguments (e.g. adapter set-duty-provenance), not pipelines.
++pub async fn run_provenance_command(cmd: &str, duty: i32, provenance: &str) -> anyhow::Result<()> {
++    let output = Command::new("sh")
++        .arg("-c")
++        .arg(format!("{cmd} \"$1\" \"$2\""))
++        .arg("coolercontrol-provenance")
++        .arg(duty.to_string())
++        .arg(provenance)
++        .kill_on_drop(true)
++        .output()
++        .await?;
++    anyhow::ensure!(
++        output.status.success(),
++        "command exited with {}",
++        output.status
++    );
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn producer_sample_is_not_retimestamped_or_coerced() {
++        let (temp, sample) = parse_sample(r#"{"temperature":63.25,"sample":{"session":"s","generation":3,"sample_id":9,"sampled_at_unix_ms":123}}"#).unwrap();
++        assert_eq!(temp, 63.25);
++        let value: serde_json::Value = serde_json::from_str(&sample).unwrap();
++        assert_eq!(value["sampled_at_unix_ms"], 123);
++        assert_eq!(value["sample_id"], 9);
++        assert!(parse_sample("63000").is_err());
++        assert!(parse_sample(r#"{"temperature":63,"sample":null}"#).is_err());
++        assert!(parse_sample(r#"{"temperature":null,"sample":{}}"#).is_err());
++        assert!(parse_sample(r#"{"temperature":1e999,"sample":{}}"#).is_err());
++        assert!(
++            parse_sample(&format!(
++                "{{\"temperature\":63,\"sample\":{{\"padding\":\"{}\"}}}}",
++                "x".repeat(16384)
++            ))
++            .is_err()
++        );
++    }
++
++    #[tokio::test]
++    async fn producer_sample_command_to_status_protobuf_preserves_complete_metadata() {
++        use prost::Message;
++        let sample = serde_json::json!({
++            "session": "test-sampler", "generation": 7, "sample_id": 101,
++            "sampled_at_unix_ms": 123, "sampled_at_monotonic_ns": 456,
++            "sensor": "cpu", "power_state": "active", "extension": {"keep": true},
++        });
++        let payload = serde_json::json!({"temperature": 63.25, "sample": sample});
++        let mut device: CustomDevice = serde_json::from_value(serde_json::json!({
++            "id": "device", "label": "test", "channels": [],
++            "temps": [{"id": "cpu", "label": "CPU", "provenance": true,
++                "command": format!("printf '%s' '{}'", payload)}],
++        }))
++        .unwrap();
++        for _ in 0..2 {
++            let statuses = poll_device_status(&device).await;
++            assert_eq!(statuses.len(), 1);
++            let status =
++                models::v1::Status::decode(statuses[0].encode_to_vec().as_slice()).unwrap();
++            assert_eq!(status.id, "cpu");
++            assert_eq!(status.metric, Some(models::v1::status::Metric::Temp(63.25)));
++            let transported: serde_json::Value =
++                serde_json::from_str(&status.sample_provenance_json).unwrap();
++            assert_eq!(transported, sample);
++        }
++        for command in ["printf 63000", "printf '{}'", "exit 1"] {
++            device.temps[0].command = command.to_owned();
++            assert!(poll_device_status(&device).await.is_empty());
++        }
++        // The old numeric path remains opt-in by absence of provenance, with no
++        // manufactured sample identity even when a numeric value is available.
++        device.temps[0].provenance = false;
++        device.temps[0].command = "printf 63000".to_owned();
++        let statuses = poll_device_status(&device).await;
++        assert_eq!(statuses.len(), 1);
++        assert_eq!(
++            statuses[0].metric,
++            Some(models::v1::status::Metric::Temp(63.0))
++        );
++        assert!(statuses[0].sample_provenance_json.is_empty());
++    }
++
++    #[tokio::test]
++    async fn provenance_is_one_literal_argument_and_failure_propagates() {
++        let json = r#"{"profile":"' ; $(exit 91) \" \n", "generation":4}"#;
++        // Nested shell asserts that neither expansion nor word splitting occurred.
++        run_provenance_command(
++            "sh -c 'test \"$#\" = 2 && test \"$1\" = 42 && test -n \"$2\"' check",
++            42,
++            json,
++        )
++        .await
++        .unwrap();
++        assert!(
++            run_provenance_command("sh -c 'exit 7' check", 42, json)
++                .await
++                .is_err()
++        );
++        assert!(
++            run_provenance_command("/nonexistent/n14-provenance-test", 42, json)
++                .await
++                .is_err()
++        );
++    }
++}
++
++fn parse_sample(out: &str) -> anyhow::Result<(f64, String)> {
++    anyhow::ensure!(out.len() <= 16384, "sample too large");
++    let value: serde_json::Value = serde_json::from_str(out)?;
++    let temperature = value["temperature"]
++        .as_f64()
++        .ok_or_else(|| anyhow::anyhow!("temperature missing"))?;
++    anyhow::ensure!(temperature.is_finite(), "nonfinite temperature");
++    anyhow::ensure!(value["sample"].is_object(), "sample object missing");
++    Ok((temperature, value["sample"].to_string()))
++}
+diff --git a/src/service.rs b/src/service.rs
+index 5d4b8dee07f4c8a793cbaaed7b6723589c1ac5ea..20131e5fd4e406568c396706f5dfe2fcd02badd4 100644
+--- a/src/service.rs
++++ b/src/service.rs
+@@ -153,13 +153,34 @@ impl DeviceService for CustomDeviceService {
+         let Some(channel) = device.channels.iter().find(|c| c.id == req.channel_id) else {
+             return Err(Status::not_found("Channel not found"));
+         };
++        if !(0..=100).contains(&req.duty) {
++            return Err(Status::invalid_argument("duty must be in 0..=100"));
++        }
++        if let Some(cmd) = channel.get_command(&config::ChannelCommand::SetDutyProvenance) {
++            if req.provenance_json.is_empty() || req.provenance_json.len() > 65536 {
++                return Err(Status::failed_precondition(
++                    "bounded producer provenance required",
++                ));
++            }
++            let label: serde_json::Value = serde_json::from_str(&req.provenance_json)
++                .map_err(|_| Status::invalid_argument("invalid provenance JSON"))?;
++            if !label.is_object() {
++                return Err(Status::invalid_argument("provenance must be an object"));
++            }
++            executor::run_provenance_command(cmd, req.duty, &req.provenance_json)
++                .await
++                .map_err(|e| Status::internal(format!("SetDutyProvenance failed: {e}")))?;
++            return Ok(Response::new(FixedDutyResponse {}));
++        }
+         let Some(cmd_template) = channel.get_command(&config::ChannelCommand::SetDuty) else {
+             return Err(Status::unimplemented(
+                 "SetDuty not configured for this channel",
+             ));
+         };
+         let cmd = cmd_template.replace("{duty}", &req.duty.to_string());
+-        let output = executor::run_shell_command(&cmd).await;
++        let output = executor::run_shell_command(&cmd)
++            .await
++            .ok_or_else(|| Status::internal("SetDuty command failed"))?;
+         debug!("SetDuty output: {output:?}");
+         Ok(Response::new(FixedDutyResponse {}))
+     }
+@@ -190,3 +211,89 @@ impl DeviceService for CustomDeviceService {
+         Err(Status::unimplemented("No Custom Function"))
+     }
+ }
++
++#[cfg(test)]
++mod provenance_tests {
++    use super::*;
++    use prost::Message;
++    fn service(command: &str, provenance: bool) -> CustomDeviceService {
++        let key = if provenance {
++            "set_duty_provenance"
++        } else {
++            "set_duty"
++        };
++        let config = serde_json::from_value(serde_json::json!({"devices":[{
++            "id":"d", "label":"test", "channels":[{"id":"fan", "label":"fan", "commands":{key:command}}], "temps":[]
++        }]})).unwrap();
++        CustomDeviceService {
++            config,
++            devices: vec![],
++        }
++    }
++    fn request(label: &str, duty: i32) -> Request<FixedDutyRequest> {
++        let message = FixedDutyRequest {
++            device_id: "d".into(),
++            channel_id: "fan".into(),
++            duty,
++            provenance_json: label.into(),
++        };
++        // Exercise actual generated protobuf encoding/decoding, not a mock field bag.
++        Request::new(FixedDutyRequest::decode(message.encode_to_vec().as_slice()).unwrap())
++    }
++    #[tokio::test]
++    async fn protobuf_to_command_preserves_literal_json() {
++        let path = std::env::temp_dir().join(format!("n14-plugin-argv-{}", std::process::id()));
++        let command = format!(
++            "sh -c 'test \"$#\" = 2 && test \"$1\" = 42 && printf %s \"$2\" > \"$0\"' {}",
++            path.display()
++        );
++        let label = r#"{"schema":1,"profile":"' $(exit 9) \" \n","generation":7}"#;
++        service(&command, true)
++            .fixed_duty(request(label, 42))
++            .await
++            .unwrap();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), label);
++        std::fs::remove_file(path).unwrap();
++    }
++    #[tokio::test]
++    async fn errors_are_rpc_errors_and_missing_provenance_never_downgrades() {
++        let svc = service("exit 9", true);
++        assert_eq!(
++            svc.fixed_duty(request("{}", 42)).await.unwrap_err().code(),
++            tonic::Code::Internal
++        );
++        assert_eq!(
++            svc.fixed_duty(request("", 42)).await.unwrap_err().code(),
++            tonic::Code::FailedPrecondition
++        );
++        assert_eq!(
++            svc.fixed_duty(request("not json", 42))
++                .await
++                .unwrap_err()
++                .code(),
++            tonic::Code::InvalidArgument
++        );
++        assert_eq!(
++            svc.fixed_duty(request("[]", 42)).await.unwrap_err().code(),
++            tonic::Code::InvalidArgument
++        );
++        assert_eq!(
++            svc.fixed_duty(request("{}", 101)).await.unwrap_err().code(),
++            tonic::Code::InvalidArgument
++        );
++        assert_eq!(
++            service("exit 8", false)
++                .fixed_duty(request("", 42))
++                .await
++                .unwrap_err()
++                .code(),
++            tonic::Code::Internal
++        );
++        assert!(
++            service("true", false)
++                .fixed_duty(request("", 42))
++                .await
++                .is_ok()
++        );
++    }
++}

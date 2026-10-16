@@ -1,6 +1,8 @@
-"""Offline tests: all GPU/NVML access is mocked; no host GPU is queried."""
-from pathlib import Path
+"""Offline EC/schema/watchdog regressions: no access to host EC or GPU."""
+from contextlib import redirect_stdout
+import io
 import json
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -10,101 +12,148 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import sensor_cache as sensors
 import thermal_state as thermal
+import coolercontrol_adapter as adapter
+import adapter_server as server
 
 
-class GpuTests(unittest.TestCase):
-    def setUp(self):
-        self.factory = Mock()
-        self.nvml = self.factory.return_value
-        self.nvml.gpu_temperature_millic.return_value = 55000
-        self.gpu = sensors.GpuSensor(Path('/fake/0000:01:00.0'), self.factory)
+def snapshot(sleep=False):
+    return dict(schema_version=2, source='ec0/io', sampled_at=100,
+                cpu_temp=61000, gpu_state='suspended' if sleep else 'active',
+                gpu_power_state='D3cold' if sleep else 'D0',
+                gpu_temp=None if sleep else 55000,
+                gpu_sampled_at=None if sleep else 100, errors=[])
 
-    def read(self, state, now=100):
-        with patch.object(sensors, 'runtime_status', return_value=state), \
-                patch.object(sensors, 'boottime', return_value=now):
-            return self.gpu.read(61000, now)
 
-    def test_sleep_does_not_even_load_nvml(self):
-        for i in range(1000):
-            result = self.read('suspended', now=i)
-        self.factory.assert_not_called()
-        self.assertIsNone(result['gpu_temp'])
-        self.assertEqual(result['gpu_input'], 61000)
+def read(data, now=101):
+    return thermal.read_snapshot(Mock(read_text=Mock(return_value=json.dumps(data))), now)
 
-    def test_unknown_transition_missing_pm_never_queries(self):
-        for state in ('suspending', 'resuming', 'unsupported', '', 'garbage'):
+
+class EcTests(unittest.TestCase):
+    def test_only_whitelisted_offsets_single_byte_readonly(self):
+        ec = sensors.EcSensor('/fake/ec')
+        with patch.object(sensors.os, 'open', return_value=7) as op, \
+                patch.object(sensors.os, 'pread', return_value=b'7') as pread, \
+                patch.object(sensors.os, 'close') as close:
+            self.assertEqual(ec.read(0x56), 55000)
+            self.assertEqual(ec.read(0x58), 55000)
+            self.assertEqual([c.args for c in pread.call_args_list], [(7, 1, 0x56), (7, 1, 0x58)])
+            flags = op.call_args.args[1]
+            self.assertEqual(flags & sensors.os.O_ACCMODE, sensors.os.O_RDONLY)
+            for offset in (0, 0x57, 0x59, True, 86.0):
+                with self.assertRaises(ValueError):
+                    ec.read(offset)
+            self.assertEqual(op.call_count, 2)
+            self.assertEqual(close.call_count, 2)
+
+    def test_invalid_ec_values_and_short_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ec'
+            ec = sensors.EcSensor(path)
+            for value in (b'', b'\0', b'\x78', b'\xff'):
+                path.write_bytes(b'\0' * 0x56 + value)
+                with self.assertRaises(ValueError):
+                    ec.read(0x56)
+            path.write_bytes(b'\0' * 0x56 + b'F')
+            self.assertEqual(ec.read(0x56), 70000)
+
+    def test_missing_debugfs_recovers_without_cached_temperature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ec'
+            ec = sensors.EcSensor(path)
+            cpu = sensors.CpuEcSensor(ec)
+            gpu = Mock(read=Mock(return_value={k: v for k, v in snapshot(True).items()
+                                            if k.startswith('gpu_')}))
+            self.assertIsNone(sensors.sample(cpu, gpu)['cpu_temp'])
+            path.write_bytes(b'\0' * 0x56 + b'F')
+            self.assertEqual(sensors.sample(cpu, gpu)['cpu_temp'], 70000)
+
+    def test_platform_guard_precedes_ec_access(self):
+        with patch('prepare.check_platform', side_effect=RuntimeError('wrong DSDT')), \
+                patch.object(sensors.os, 'geteuid', return_value=0), \
+                patch.object(sensors, 'EcSensor') as ec:
             with self.assertRaises(RuntimeError):
-                self.read(state)
-        with patch.object(sensors, 'runtime_status', side_effect=OSError):
+                sensors.main()
+            ec.assert_not_called()
+
+    def test_no_legacy_temperature_backends(self):
+        source = (ROOT / 'sensor_cache.py').read_text()
+        for forbidden in ('ctypes', 'Nvml', 'coretemp', 'nvidia-smi', 'N14_GPU_POLL'):
+            self.assertNotIn(forbidden, source)
+
+
+class PowerTests(unittest.TestCase):
+    def test_requires_both_states_and_consistent_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp)
+            (device / 'power').mkdir()
+            for runtime, power in [('active', 'D0'), ('suspended', 'D3cold'),
+                                   ('suspended', 'D0'), ('active', 'D3cold'),
+                                   ('suspending', 'D3cold'), ('unknown', 'unknown')]:
+                (device / 'power/runtime_status').write_text(runtime)
+                (device / 'power_state').write_text(power)
+                if (runtime, power) in [('active', 'D0'), ('suspended', 'D3cold')]:
+                    self.assertEqual(sensors.power_state(device), (runtime, power))
+                else:
+                    with self.assertRaises(RuntimeError):
+                        sensors.power_state(device)
+            (device / 'power_state').unlink()
             with self.assertRaises(OSError):
-                self.gpu.read(61000, 100)
-        self.factory.assert_not_called()
-
-    def test_second_gate_precedes_library_loading(self):
-        with patch.object(sensors, 'runtime_status', side_effect=['active', 'suspended']):
+                sensors.power_state(device)
+        with patch.object(Path, 'read_text', side_effect=['active', 'D0', 'suspended', 'D3cold']):
             with self.assertRaises(RuntimeError):
-                self.gpu.read(61000, 100)
-        self.factory.assert_not_called()
+                sensors.power_state(Path('/fake'))
 
-    def test_active_sample_always_closes_session(self):
-        result = self.read('active')
-        self.assertEqual(result['gpu_temp'], 55000)
-        self.assertEqual([c[0] for c in self.nvml.mock_calls],
-                         ['start', 'gpu_temperature_millic', 'close'])
-
-    def test_active_sampling_is_rate_limited(self):
-        self.read('active', 100)
-        self.read('active', 101)
-        self.read('active', 104.9)
-        self.nvml.start.assert_called_once()
-        self.read('active', 105)
-        self.assertEqual(self.nvml.start.call_count, 2)
-
-    def test_sleep_releases_no_session_and_wake_samples_immediately(self):
-        self.read('active', 100)
-        self.read('suspended', 101)
-        self.nvml.close.assert_called_once()
-        self.read('active', 102)
-        self.assertEqual(self.nvml.start.call_count, 2)
-
-    def test_failed_read_or_init_closes_and_invalidates(self):
-        for method in ('start', 'gpu_temperature_millic'):
-            with self.subTest(method=method):
-                self.setUp()
-                getattr(self.nvml, method).side_effect = RuntimeError('lost GPU')
-                with self.assertRaises(RuntimeError):
-                    self.read('active')
-                self.nvml.close.assert_called_once()
-                self.assertIsNone(self.gpu.last_at)
-
-    def test_sleep_cooldown_does_not_forge_actual_temperature(self):
-        self.nvml.gpu_temperature_millic.return_value = 75000
-        self.read('active', 100)
-        result = self.read('suspended', 102)
-        self.assertEqual(result['gpu_input'], 75000)
+    def test_sleep_has_no_gpu_ec_read_and_no_substitution(self):
+        ec = Mock()
+        gpu = sensors.GpuEcSensor(ec, Path('/fake'))
+        with patch.object(sensors, 'power_state', return_value=('suspended', 'D3cold')):
+            result = gpu.read(100)
+        ec.read.assert_not_called()
         self.assertIsNone(result['gpu_temp'])
-        self.assertEqual(self.read('suspended', 116)['gpu_input'], 61000)
+        self.assertIsNone(result['gpu_sampled_at'])
+        self.assertNotIn('gpu_input', result)
 
-    def test_strict_no_query_never_loads_driver(self):
-        self.gpu.poll = False
-        with self.assertRaises(RuntimeError):
-            self.read('active')
-        self.read('suspended')
-        self.factory.assert_not_called()
+    def test_active_samples_only_gput_and_wake_has_no_old_cache(self):
+        ec = Mock(read=Mock(side_effect=[55000, 56000]))
+        gpu = sensors.GpuEcSensor(ec, Path('/fake'))
+        for state, expected in [(('active', 'D0'), 55000),
+                                (('suspended', 'D3cold'), None),
+                                (('active', 'D0'), 56000)]:
+            with patch.object(sensors, 'power_state', return_value=state):
+                self.assertEqual(gpu.read(100)['gpu_temp'], expected)
+        self.assertEqual([c.args for c in ec.read.call_args_list], [(0x58,), (0x58,)])
 
-    def test_read_errors_publish_invalid_not_last_good(self):
-        cpu = Mock(read=Mock(return_value=61000))
-        gpu = Mock(read=Mock(side_effect=RuntimeError('failed')))
-        data = sensors.sample(cpu, gpu)
-        self.assertIsNone(data['gpu_temp'])
-        self.assertEqual(data['gpu_input'], 61000)
+    def test_race_is_error_not_sleep(self):
+        for states in [[('active', 'D0'), ('suspended', 'D3cold')],
+                       [('suspended', 'D3cold'), ('active', 'D0')]]:
+            with patch.object(sensors, 'power_state', side_effect=states):
+                gpu = sensors.GpuEcSensor(Mock(read=Mock(return_value=55000)), Path('/fake'))
+                data = sensors.sample(Mock(read=Mock(return_value=61000)), gpu)
+            self.assertEqual(data['gpu_state'], 'error')
+            self.assertIsNone(data['gpu_temp'])
+            self.assertNotIn('gpu_input', data)
+
+    def test_invalid_active_value_never_becomes_sleep_or_cpu(self):
+        gpu = sensors.GpuEcSensor(Mock(read=Mock(side_effect=ValueError('zero'))), Path('/fake'))
+        with patch.object(sensors, 'power_state', return_value=('active', 'D0')):
+            data = sensors.sample(Mock(read=Mock(return_value=61000)), gpu)
         self.assertEqual(data['gpu_state'], 'error')
+        self.assertIsNone(data['gpu_temp'])
+        self.assertTrue(data['errors'])
 
-    def test_discovery_ignores_audio_and_rejects_multiple_gpus(self):
+    def test_timestamp_precedes_io(self):
+        with patch.object(sensors, 'boottime', return_value=100) as clock:
+            cpu = Mock()
+            cpu.read.side_effect = lambda: (clock.assert_called_once(), 61000)[1]
+            data = sensors.sample(cpu, Mock(read=Mock(return_value={})))
+        self.assertEqual(data['sampled_at'], 100)
+
+    def test_discovery_rejects_ambiguous_devices(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for name, cls in [('gpu', '0x030000'), ('audio', '0x040300')]:
-                path = root / name; path.mkdir()
+                path = root / name
+                path.mkdir()
                 (path / 'vendor').write_text('0x10de')
                 (path / 'class').write_text(cls)
             self.assertEqual(sensors.discover_gpu(root), root / 'gpu')
@@ -112,112 +161,100 @@ class GpuTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 sensors.discover_gpu(root)
 
-    def test_nvml_is_lazy_and_has_no_cli_runner(self):
-        source = (ROOT / 'sensor_cache.py').read_text()
-        self.assertNotIn('subprocess', source)
-        self.assertNotIn('nvmlDeviceGetCount', source)
-        self.assertNotIn('nvmlDeviceGetHandleByIndex', source)
-
-
-class CpuTests(unittest.TestCase):
-    def test_cache_paths_and_rediscover_on_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); hw = root / 'hwmon0'; hw.mkdir()
-            (hw / 'name').write_text('coretemp')
-            (hw / 'temp1_input').write_text('55000')
-            (hw / 'temp2_input').write_text('60000')
-            cpu = sensors.CpuSensor(root)
-            self.assertEqual(cpu.read(), 60000)
-            paths = cpu.paths
-            self.assertEqual(cpu.read(), 60000)
-            self.assertIs(cpu.paths, paths)
-            (hw / 'temp2_input').unlink()
-            with self.assertRaises(OSError):
-                cpu.read()
-            self.assertEqual(cpu.paths, [])
-            self.assertEqual(cpu.read(), 55000)
-
-    def test_invalid_cpu_not_silently_discarded(self):
-        cpu = sensors.CpuSensor()
-        cpu.paths = [Mock(read_text=Mock(return_value='-273150'))]
-        with self.assertRaises(ValueError):
-            cpu.read()
-
 
 class SnapshotTests(unittest.TestCase):
-    def data(self):
-        return {'sampled_at': 100, 'cpu_temp': 61000, 'gpu_state': 'active',
-                'gpu_temp': 55000, 'gpu_input': 55000, 'gpu_sampled_at': 97}
+    def test_valid_states_request_distinct_curves(self):
+        self.assertEqual(thermal.requested_curve(read(snapshot())), 'max')
+        self.assertEqual(thermal.requested_curve(read(snapshot(True))), 'cpu')
 
-    def read(self, data, now=101):
-        path = Mock(read_text=Mock(return_value=json.dumps(data)))
-        return thermal.read_snapshot(path, now)
+    def test_error_unknown_or_contradictory_states_fail_closed(self):
+        for changes in [dict(gpu_state='error'), dict(gpu_state='resuming'),
+                        dict(gpu_power_state='D3cold'), dict(errors=['EC transport error']),
+                        dict(gpu_input=61000), dict(schema_version=1), dict(source='nvml')]:
+            data = snapshot()
+            data.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                read(data)
+        for changes in [dict(gpu_power_state='D0'), dict(gpu_temp=0),
+                        dict(gpu_temp=61000), dict(gpu_sampled_at=100)]:
+            data = snapshot(True)
+            data.update(changes)
+            with self.assertRaises(ValueError):
+                read(data)
 
-    def test_valid_active(self):
-        self.assertEqual(self.read(self.data())['gpu_temp'], 55000)
-
-    def test_cpu_snapshot_survives_gpu_error(self):
-        data = self.data()
-        data.update(gpu_state='error', gpu_temp=None, gpu_input=61000, gpu_sampled_at=None)
-        path = Mock(read_text=Mock(return_value=json.dumps(data)))
-        self.assertEqual(thermal.read_cpu_snapshot(path, 101)['cpu_temp'], 61000)
-
-    def test_stale_future_and_suspend_gap_rejected(self):
+    def test_stale_future_suspend_gap_and_invalid_values(self):
         for now in (99, 106, 10000, float('nan')):
             with self.assertRaises(ValueError):
-                self.read(self.data(), now)
-
-    def test_gpu_age_independent_of_snapshot(self):
-        data = self.data(); data['gpu_sampled_at'] = 90
-        with self.assertRaises(ValueError):
-            self.read(data)
-
-    def test_invalid_temperatures(self):
-        for key in ('cpu_temp', 'gpu_temp', 'gpu_input'):
+                read(snapshot(), now)
+        for field in ('cpu_temp', 'gpu_temp'):
             for value in (None, 0, -1, 120000, True, '55000', 55000.5):
-                data = self.data(); data[key] = value
-                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
-                    self.read(data)
-
-    def test_sleep_fallback_is_explicit(self):
-        data = self.data()
-        data.update(gpu_state='suspended', gpu_temp=None, gpu_input=61000, gpu_sampled_at=None)
-        self.assertIsNone(self.read(data)['gpu_temp'])
-        data['gpu_temp'] = 55000
+                data = snapshot()
+                data[field] = value
+                with self.assertRaises(ValueError):
+                    read(data)
+        data = snapshot()
+        data['gpu_sampled_at'] = 90
         with self.assertRaises(ValueError):
-            self.read(data)
+            read(data)
+        for data in (None, [], 1, 'bad'):
+            with self.assertRaises(ValueError):
+                read(data)
 
-    def test_error_state_requires_cpu_fallback(self):
-        data = self.data()
-        data.update(gpu_state='error', gpu_temp=None, gpu_input=61000, gpu_sampled_at=None)
-        self.assertEqual(self.read(data)['gpu_input'], 61000)
-        data['gpu_input'] = None
+    def test_cpu_remains_visible_on_gpu_failure(self):
+        data = snapshot()
+        data.update(gpu_state='error', gpu_temp=None, gpu_sampled_at=None)
+        path = Mock(read_text=Mock(return_value=json.dumps(data)))
+        self.assertEqual(thermal.read_cpu_snapshot(path, 101)['cpu_temp'], 61000)
         with self.assertRaises(ValueError):
-            self.read(data)
+            read(data)
 
-    def test_unknown_state_not_converted_to_zero(self):
-        data = self.data(); data['gpu_state'] = 'transitioning'
-        with self.assertRaises(ValueError):
-            self.read(data)
-
-    def test_atomic_write_has_no_fsync_and_no_temporary_left(self):
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(sensors, 'RUNTIME_DIR', Path(tmp)), \
-                patch.object(sensors.os, 'fsync') as fsync:
-            sensors.write_snapshot(self.data())
-            self.assertEqual(json.loads((Path(tmp) / 'temperatures.json').read_text()), self.data())
+    def test_atomic_write(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(sensors, 'RUNTIME_DIR', Path(tmp)):
+            sensors.write_snapshot(snapshot())
+            self.assertEqual(json.loads((Path(tmp) / 'temperatures.json').read_text()), snapshot())
             self.assertEqual(len(list(Path(tmp).iterdir())), 1)
-            fsync.assert_not_called()
 
-    def test_default_daemon_mode_never_queries_gpu(self):
-        with patch.dict(sensors.os.environ, {}, clear=True):
-            self.assertEqual(sensors.os.environ.get('N14_GPU_POLL'), None)
-            self.assertFalse(sensors.os.environ.get('N14_GPU_POLL', 'never') != 'never')
-
-    def test_clock_is_suspend_aware(self):
+    def test_suspend_aware_clock(self):
         with patch.object(thermal.time, 'clock_gettime', return_value=100) as clock:
             self.assertEqual(thermal.boottime(), 100)
             clock.assert_called_once_with(thermal.time.CLOCK_BOOTTIME)
+
+
+class ConsumerTests(unittest.TestCase):
+    def test_cpu_85_sleep_does_not_trigger_gpu_80_threshold(self):
+        data = snapshot(True)
+        data['cpu_temp'] = 85000
+        self.assertFalse(thermal.critical_temperature(read(data)))
+        data['cpu_temp'] = 90000
+        self.assertTrue(thermal.critical_temperature(read(data)))
+        data = snapshot()
+        data['gpu_temp'] = 80000
+        self.assertTrue(thermal.critical_temperature(read(data)))
+
+    def test_adapter_never_emits_cpu_zero_or_none_as_sleep_temperature(self):
+        out = io.StringIO()
+        with patch.object(adapter, 'read_snapshot', return_value=snapshot(True)), \
+                redirect_stdout(out), self.assertRaises(adapter.GpuAsleep):
+            adapter.read_gpu_temp()
+        self.assertEqual(out.getvalue(), '')
+
+    def test_watchdog_requests_full_on_invalid_data(self):
+        for error in (ValueError('active GPU invalid'), OSError('transport unavailable')):
+            with patch.object(server, 'read_snapshot', side_effect=error), \
+                    patch.object(server, 'dispatch', return_value=b'OK ok\n') as dispatch:
+                server.ThermalWatchdog().tick()
+                dispatch.assert_called_once_with('fence-close-full')
+
+    def test_low_command_promoted_to_full_on_sensor_error(self):
+        from protocol_fixtures import Harness
+        harness = Harness()
+        self.addCleanup(harness.close)
+        with patch.object(adapter, 'read_snapshot', side_effect=ValueError('failed')):
+            with self.assertRaises(ValueError):
+                adapter.set_both(adapter.MIN_COMMAND)
+        self.assertEqual([c.args for c in harness.writes.call_args_list],
+                         [(adapter.MODE, 2), (adapter.CPU_TARGET, adapter.MAX_RAW),
+                          (adapter.GPU_TARGET, adapter.MAX_RAW)])
 
 
 if __name__ == '__main__':
