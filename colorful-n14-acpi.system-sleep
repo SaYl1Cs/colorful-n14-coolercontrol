@@ -1,0 +1,125 @@
+#!/usr/bin/python3
+"""System-sleep hook: root-only adapter RPC, never direct ACPI/EC access.
+
+The adapter owns firmware serialization. Early lid reconciliation precedes the
+lighting transaction; bounded re-polls handle delayed physical lid updates.
+No D-Bus call to a possibly frozen user session, fan override or mode selection.
+"""
+import json
+import os
+import socket
+import struct
+import sys
+import time
+
+SOCKET = '/run/colorful-n14-control/adapter.sock'
+COMMANDS = frozenset(('keylight-save', 'keylight-restore', 'keylight-reapply', 'lid-refresh'))
+RPC_TIMEOUT = 0.75
+POST_BUDGET = 5.0
+
+
+def report(message):
+    print('colorful-n14-acpi: ' + message, file=sys.stderr, flush=True)
+
+
+def request(command, timeout=RPC_TIMEOUT):
+    if command not in COMMANDS:
+        raise ValueError('unapproved sleep command')
+    deadline = time.monotonic() + timeout
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        def remaining():
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError('adapter RPC timeout')
+            connection.settimeout(value)
+        remaining()
+        connection.connect(SOCKET)
+        _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid != 0:
+            raise ValueError('adapter peer is not root')
+        remaining()
+        connection.sendall((command + '\n').encode('ascii'))
+        reply = bytearray()
+        while b'\n' not in reply and len(reply) < 4096:
+            remaining()
+            chunk = connection.recv(4096 - len(reply))
+            if not chunk:
+                break
+            reply.extend(chunk)
+    if (not reply.endswith(b'\n') or reply.count(b'\n') != 1 or
+            b'\0' in reply or b'\r' in reply or len(reply) >= 4096):
+        raise ValueError('invalid adapter reply framing')
+    if not reply.startswith(b'OK '):
+        raise ValueError('adapter rejected sleep command')
+    text = reply[3:-1].decode('ascii')
+    return None if text == 'ok' else json.loads(text)
+
+
+def lid_open(value):
+    return (type(value) is dict and value.get('controller_open') is True and
+            value.get('cached_open') is True)
+
+
+def main(action, rpc=request, clock=time.monotonic, sleep=time.sleep, emit=report):
+    if action not in ('pre', 'post'):
+        return 0
+    if action == 'pre':
+        try:
+            value = rpc('keylight-save')
+            emit('saved pre-sleep brightness=' + str(value))
+        except (OSError, ValueError, TypeError) as exc:
+            emit('keylight-save failed: ' + type(exc).__name__)
+        return 0  # Diagnostics must not prevent the actual sleep operation.
+
+    deadline = clock() + POST_BUDGET
+    def post_request(command):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            emit('post-resume time budget exhausted')
+            return None
+        try:
+            result = rpc(command, timeout=min(RPC_TIMEOUT, remaining))
+            emit(command + ' succeeded')
+            return result
+        except (OSError, ValueError, TypeError) as exc:
+            emit(command + ' failed: ' + type(exc).__name__)
+            return None
+
+    state = post_request('lid-refresh')
+    # The firmware/EC may still be settling immediately after S3. Give the
+    # adapter one bounded second before its first lighting transaction.
+    remaining = deadline - clock()
+    if remaining > 1.0:
+        sleep(1.0)
+    # A failed restore leaves pending armed; a successful restore is one-shot.
+    value = post_request('keylight-restore')
+    emit('restore result=' + str(value))
+    # Reapply once after the first transaction: integrated deep testing showed
+    # a write can succeed before the physical LED channel is ready. This command
+    # is only issued by this post hook and uses the current root-private state.
+    remaining = deadline - clock()
+    if remaining > 1.0:
+        sleep(1.0)
+        retry = post_request('keylight-reapply')
+        emit('reapply result=' + str(retry))
+    if lid_open(state):
+        return 0
+    for delay in (0.1, 0.25, 0.5, 1.0):
+        remaining = deadline - clock()
+        if remaining <= delay:
+            break
+        sleep(delay)
+        state = post_request('lid-refresh')
+        if lid_open(state):
+            return 0
+    if type(state) is dict:
+        emit('lid is still reported closed; no forced-open override applied')
+    else:
+        emit('lid state unavailable after bounded polling')
+    return 0
+
+
+if __name__ == '__main__':
+    if os.geteuid() != 0:
+        raise SystemExit('root required for the system sleep hook')
+    raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else ''))

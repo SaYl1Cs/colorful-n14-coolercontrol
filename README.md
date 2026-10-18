@@ -68,11 +68,50 @@ have **not** been validated. Details: [QUIET-LIFECYCLE.md](QUIET-LIFECYCLE.md).
 - [thermal_state.py](thermal_state.py): suspend-aware freshness and temperature validation.
 - [adapter_server.py](adapter_server.py): serial root-only control socket and watchdog.
 - [src/adapter_client.c](src/adapter_client.c): small socket client; no Python startup per plugin poll.
-- [coolercontrol_adapter.py](coolercontrol_adapter.py): guarded firmware access.
+- [coolercontrol_adapter.py](coolercontrol_adapter.py): guarded fan, keyboard-light and lid firmware access.
 - [profile_selector_service.py](profile_selector_service.py): authenticated CPU/Mix selection.
 - [provenance_fence.py](provenance_fence.py): rejection of stale/mismatched control commands.
+- [colorful-n14-acpi.system-sleep](colorful-n14-acpi.system-sleep): pre/post-sleep coordination through the adapter socket.
 - [patches](patches): matching CoolerControl 5.0.1/custom-device 0.2.0 producer patches.
 - [install.sh](install.sh): preflight, backup, timed recovery, installation and rollback.
+
+### Keyboard backlight
+
+The indexed EC protocol uses register 0x5B on the pinned N14 24 / BIOS 2.07 /
+55:71 controller. Brightness 0..100 maps to raw values 175..0. Physical tests on
+2026-10-18 confirmed that manual fan mode can prevent brightness application
+although register readback changes. Temporarily selecting automatic fan mode
+and waiting **20 ms before the lighting write**, with no intentional post-write
+wait, made the physical transitions work. This is a tested setting, not a proven
+minimum or a timing guarantee on other firmware.
+
+The transaction runs inside the existing serial root-only adapter. It restores
+both individual fan targets only while fresh thermal/provenance checks still
+authorize them; otherwise it requests protective full duty and fences old
+commands. Curves, leases, sample clocks and critical-temperature protections are
+not relaxed. See [sleep coordination and validation](SLEEP-COORDINATION.md).
+
+The installed client supports:
+
+```sh
+sudo /usr/local/libexec/colorful-n14-coolercontrol keylight-get
+sudo /usr/local/libexec/colorful-n14-coolercontrol keylight-set 50
+```
+
+The system-sleep hook saves the exact pre-sleep brightness byte, including off,
+and requests a one-shot restore after resume. It first refreshes the lid cache
+from the controller using the validated firmware handler, waits one second for
+post-S3 firmware/EC settling, restores lighting, waits one more second, and
+performs one bounded reapply. A failed first restore remains pending for this
+retry; a successful restore is not replayed by duplicate sleep notifications.
+It then re-polls a delayed lid update within a bounded five-second budget. It
+never forces a physically closed lid open. Errors are logged; all firmware
+requests use the same adapter socket, with no direct ACPI/EC access in the hook
+or dependency on a user-session D-Bus service.
+
+No sleep-mode default is changed. Register readback is not a measurement of
+physical light output: the integrated deep-resume behavior must be checked on
+the actual laptop, separately from the successful isolated brightness tests.
 
 The temperature sampler uses no NVIDIA API, GPU enumeration API, raw EC scan or
 EC write. Global `ec_sys.write_support` is **left unchanged**. Existing fan

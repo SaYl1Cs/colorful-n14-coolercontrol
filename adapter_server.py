@@ -28,8 +28,9 @@ MAX_PROVENANCE = 65536
 MAX_REQUEST = MAX_PROVENANCE + 128
 MAX_REPLY = MAX_PROVENANCE + 1024
 READS = {'get-rpm', 'get-duty', 'temp-cpu', 'temp-gpu', 'temp-cpu-json', 'temp-gpu-json',
-         'temp-cpu/json', 'temp-gpu/json', 'self-check', 'enable'}
+         'temp-cpu/json', 'temp-gpu/json', 'self-check', 'enable', 'keylight-get'}
 DUTY = re.compile(r'(?:100|[0-9]{1,2})\Z')
+KEYLIGHT = re.compile(r'(?:100|[0-9]{1,2})\Z')
 
 
 _STOPPING_UNTIL = 0.0
@@ -151,6 +152,18 @@ def _rpc(request):
     if action == 'set-duty' and payload == '100':
         adapter.fixed_full()
         return None
+    if action == 'keylight-set' and sep and KEYLIGHT.fullmatch(payload):
+        return adapter.set_key_brightness(int(payload))
+    if action == 'keylight-save' and not sep:
+        return adapter.save_key_brightness()
+    if action == 'keylight-restore' and not sep:
+        return adapter.restore_key_brightness()
+    if action == 'keylight-reapply' and not sep:
+        return adapter.reapply_key_brightness()
+    if action == 'lid-refresh' and not sep:
+        return adapter.refresh_lid()
+    if action == 'keylight-get' and not sep:
+        return adapter.read_key_brightness()
     if action in READS and not sep:
         adapter.main(['adapter', action])
         return None
@@ -194,9 +207,11 @@ def dispatch(request):
         # Log only an allowlisted action and source-owned reason; never payloads.
         action = request.partition(' ')[0] if type(request) is str else 'invalid'
         actions = READS | {'reset', 'lifecycle-stop', 'sensor-check', 'set-duty',
-                          'set-duty-provenance', 'install-assignment', 'renew-assignment',
-                          'fence-handover', 'fence-close-full', 'fence-close',
-                          'fence-status', 'assignment-status'}
+                           'set-duty-provenance', 'install-assignment', 'renew-assignment',
+                           'fence-handover', 'fence-close-full', 'fence-close',
+                           'fence-status', 'assignment-status', 'keylight-set',
+                           'keylight-save', 'keylight-restore', 'keylight-reapply',
+                           'lid-refresh'}
         action = action if action in actions else 'invalid'
         print('Adapter request rejected [' + action + ']: ' + fence.rejection_reason(exc),
               file=sys.stderr, flush=True)

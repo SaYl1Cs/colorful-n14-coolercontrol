@@ -375,6 +375,10 @@ class StagingAndApply(TemporaryRoot):
         tree = directory / 'tree'
         for name in tx.MODULES:
             self.assertTrue((tree / tx.PREFIX.lstrip('/') / name).is_file())
+        hook = tree / tx.SYSTEM_SLEEP_HOOK.lstrip('/')
+        self.assertEqual(hook.read_text(), (PROJECT / 'colorful-n14-acpi.system-sleep').read_text())
+        self.assertEqual(hook.stat().st_mode & 0o777, 0o755)
+        self.assertIn(tx.SYSTEM_SLEEP_HOOK, tx.transaction_paths(layout))
         dropin = (tree / 'etc/systemd/system/coolercontrold.service.d/colorful-n14-control.conf').read_text()
         self.assertIn('Wants=' + tx.SELECTOR, dropin)
         self.assertIn('ExecStart=\nExecStart="' + tx.DAEMON, dropin)

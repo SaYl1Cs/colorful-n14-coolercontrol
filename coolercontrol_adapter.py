@@ -15,6 +15,8 @@ import json
 import os
 import re
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -42,8 +44,15 @@ MODE = 0x50
 CPU_TARGET = 0x54
 GPU_TARGET = 0x55
 CPU_TACH = 0x5C
+KEYLIGHT = 0x5B
+KEYLIGHT_RAW_MAX = 175
 MIN_COMMAND = 1  # UI 0%: fans physically stop on this machine.
 MAX_RAW = 70     # UI 100%.
+KEYLIGHT_STATE = Path('/run/colorful-n14-control/keylight.json')
+KEYLIGHT_SETTLE_SECONDS = 0.020  # Physically verified before write; no post-write sleep.
+LID_CONTROLLER = r'\_SB.PC00.LPCB.EC0.PSTA'
+LID_CACHE = r'\LIDS'
+LID_REFRESH = r'\_SB.PC00.LPCB.EC0._Q14'
 _IDENTITY_CHECKED = False
 _RISE_STATE_UNCERTAIN = False  # Cleared only by a successfully recorded fan command.
 _LAST_SAFE_SNAPSHOT = None  # Process-local; never rejuvenate original sample clocks.
@@ -159,6 +168,28 @@ def acpi(index: int, value: int | None = None, port: int = PORT) -> int:
     return parse_result(response)
 
 
+def acpi_method(method: str) -> int:
+    """Evaluate a fixed, model-pinned ACPI method through the shared transport."""
+    if method not in {LID_CONTROLLER, LID_CACHE, LID_REFRESH}:
+        fail("unapproved direct ACPI method")
+    request = method.encode("ascii")
+    try:
+        fd = os.open(PROC_CALL, os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            if os.write(fd, request) != len(request):
+                fail("short ACPI method request")
+        finally:
+            os.close(fd)
+        fd = os.open(PROC_CALL, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            response = os.read(fd, 4096).decode("ascii")
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        fail(f"ACPI method call failed: {exc}")
+    return parse_result(response)
+
+
 def check_permission(require_control: bool) -> None:
     try:
         ticket = PERMISSION.read_text(encoding="ascii")
@@ -191,6 +222,215 @@ def write_raw(index: int, value: int) -> None:
         fail("fan command must be in 0..70")
     if acpi(index, value) != 0:
         fail(f"firmware rejected write to 0x{index:02x}")
+
+
+def _keylight_percent_from_raw(raw: int) -> int:
+    if type(raw) is not int or not 0 <= raw <= KEYLIGHT_RAW_MAX:
+        fail("keyboard-light register is outside 0..175")
+    return ((KEYLIGHT_RAW_MAX - raw) * 100 + KEYLIGHT_RAW_MAX - 1) // KEYLIGHT_RAW_MAX
+
+
+def _keylight_raw_from_percent(percent: int) -> int:
+    if type(percent) is not int or not 0 <= percent <= 100:
+        fail("keyboard brightness must be an integer from 0 to 100")
+    return KEYLIGHT_RAW_MAX - (percent * KEYLIGHT_RAW_MAX // 100)
+
+
+def read_key_brightness() -> int:
+    guarded(False)
+    return _keylight_percent_from_raw(acpi(KEYLIGHT))
+
+
+def _write_key_raw(raw: int) -> None:
+    _keylight_percent_from_raw(raw)  # Strict byte/range validation, including bool.
+    if acpi(KEYLIGHT, raw) != 0:
+        fail("firmware rejected keyboard-light write")
+
+
+def _keylight_fan_targets(targets):
+    """Validate cached targets without renewing a cooling lease or deadline."""
+    if (type(targets) is not tuple or len(targets) != 2 or
+            not all(type(v) is int and MIN_COMMAND <= v <= MAX_RAW for v in targets)):
+        raise ValueError('invalid last applied duty')
+    if targets == (MAX_RAW, MAX_RAW):
+        return targets
+    check_applied_duty()
+    data = current_control_snapshot()
+    state = provenance_fence._read()
+    if 'hold_until' in state:
+        provenance_fence.check_hold(state)
+        if state['phase'] != 'closed':
+            provenance_fence.check_current(state, data)
+        if state['hold_epoch'] != thermal_state.epoch(data) or not cool_for_hold(data):
+            raise ValueError('sampler epoch/mode changed')
+        expected = tuple(state['held_raw'])
+        live_policy = state['hold_policy']
+        if live_policy is not None:
+            control_policy.validate_policy(live_policy)
+            floor = MIN_COMMAND + round(control_policy.curve_demand(live_policy, data) *
+                                        (MAX_RAW - MIN_COMMAND) / 100)
+            if any(v < floor for v in targets):
+                raise ValueError('invalid last applied duty')
+    else:
+        provenance_fence.check_current(state, data)
+        raw = MIN_COMMAND + round(state['last_duty'] * (MAX_RAW - MIN_COMMAND) / 100)
+        expected = (raw, raw)
+        if provenance_fence.transition_raise_duty(data) is not None:
+            raise ValueError('invalid last applied duty')
+    if targets != expected:
+        raise ValueError('invalid last applied duty')
+    if read_live_power_state() != (data['gpu_state'], data['gpu_power_state']):
+        raise ValueError('GPU changed mode before fan write')
+    return targets
+
+
+def _keylight_return_fans(targets):
+    try:
+        targets = _keylight_fan_targets(targets)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit):
+        # Resume can invalidate samples/authority: never restore stale low duty.
+        try:
+            provenance_fence.close()
+        finally:
+            _write_both(MAX_RAW, 100)
+        provenance_fence.mark_full()
+        print('Keyboard lighting: stale/invalid fan targets; protective full duty',
+              file=sys.__stderr__, flush=True)
+        return
+    write_raw(MODE, 2)
+    write_raw(CPU_TARGET, targets[0])
+    write_raw(GPU_TARGET, targets[1])
+    if (read_raw(MODE) != 2 or read_raw(CPU_TARGET) != targets[0] or
+            read_raw(GPU_TARGET) != targets[1]):
+        raise ValueError('invalid last applied duty')
+
+
+def _apply_key_raw(raw: int) -> None:
+    """Serial adapter owner: automatic -> 20 ms -> light -> safe fan return."""
+    _keylight_percent_from_raw(raw)
+    guarded(True)
+    mode = read_raw(MODE)
+    if mode not in (0, 2):
+        fail("refusing keyboard-light write with unknown fan mode")
+    manual = mode == 2
+    targets = (read_raw(CPU_TARGET), read_raw(GPU_TARGET)) if manual else None
+    try:
+        if manual:
+            write_raw(MODE, 0)
+        time.sleep(KEYLIGHT_SETTLE_SECONDS)
+        if read_raw(MODE) != 0:
+            fail("automatic fan mode not confirmed for keyboard lighting")
+        _write_key_raw(raw)
+        # No post-write sleep: physically verified at 20 ms.
+        if manual:
+            _keylight_return_fans(targets)
+        if acpi(KEYLIGHT) != raw:
+            fail("keyboard-light register readback mismatch")
+    except BaseException:
+        if manual:
+            _failed_write_full()
+        raise
+
+
+def set_key_brightness(percent: int) -> int:
+    raw = _keylight_raw_from_percent(percent)
+    _apply_key_raw(raw)
+    _save_key_brightness(raw, pending=False)
+    return percent
+
+
+def _save_key_brightness(raw: int, *, pending: bool) -> None:
+    percent = _keylight_percent_from_raw(raw)
+    parent = KEYLIGHT_STATE.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.keylight.', dir=parent, text=True)
+    try:
+        with os.fdopen(fd, 'w', encoding='ascii') as stream:
+            json.dump({'schema': 1, 'raw': raw, 'brightness': percent, 'pending': pending},
+                      stream, separators=(',', ':'), allow_nan=False)
+            stream.write('\n')
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, KEYLIGHT_STATE)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def save_key_brightness() -> int:
+    # A failed pre-sleep read must not leave an older pending restore armed.
+    KEYLIGHT_STATE.unlink(missing_ok=True)
+    guarded(False)
+    raw = acpi(KEYLIGHT)
+    _save_key_brightness(raw, pending=True)
+    return _keylight_percent_from_raw(raw)
+
+
+def _read_keylight_state():
+    try:
+        text = KEYLIGHT_STATE.read_text(encoding='ascii')
+    except FileNotFoundError:
+        return None
+    if len(text) > 4096:
+        fail("keyboard-light state is too large")
+    try:
+        state = thermal_state.strict_json(text)
+    except (ValueError, TypeError):
+        fail("keyboard-light state is invalid")
+    if (type(state) is not dict or set(state) != {'schema', 'raw', 'brightness', 'pending'} or
+            type(state['schema']) is not int or state['schema'] != 1 or
+            type(state['pending']) is not bool):
+        fail("keyboard-light state has an unsupported schema")
+    percent = _keylight_percent_from_raw(state['raw'])
+    if type(state['brightness']) is not int or state['brightness'] != percent:
+        fail("keyboard-light state is inconsistent")
+    return state, percent
+
+
+def restore_key_brightness() -> int | None:
+    state = _read_keylight_state()
+    if state is None:
+        return None
+    state, percent = state
+    if not state['pending']:
+        return None
+    # Keep pending armed until the transaction succeeds, so a bounded post hook
+    # retry can recover from an adapter/firmware race after resume.
+    _apply_key_raw(state['raw'])
+    _save_key_brightness(state['raw'], pending=False)
+    return percent
+
+
+def reapply_key_brightness() -> int | None:
+    """Bounded post-resume retry; uses only the current root-private state."""
+    state = _read_keylight_state()
+    if state is None:
+        return None
+    state, percent = state
+    _apply_key_raw(state['raw'])
+    if state['pending']:
+        _save_key_brightness(state['raw'], pending=False)
+    return percent
+
+
+def lid_state() -> dict[str, bool]:
+    guarded(False)
+    controller = acpi_method(LID_CONTROLLER)
+    cached = acpi_method(LID_CACHE)
+    if cached not in (0, 1):
+        fail("invalid cached lid state")
+    return {'controller_open': bool(controller & 0x04), 'cached_open': bool(cached)}
+
+
+def refresh_lid() -> dict[str, bool]:
+    state = lid_state()
+    if state['controller_open'] != state['cached_open']:
+        acpi_method(LID_REFRESH)
+        state = lid_state()
+    if state['controller_open'] != state['cached_open']:
+        fail("firmware lid state did not converge after refresh")
+    return state
 
 
 _GPU_DEVICE = None

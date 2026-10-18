@@ -19,6 +19,7 @@ import tomllib
 
 PREFIX = '/usr/local/share/colorful-n14-control'
 CLIENT = '/usr/local/libexec/colorful-n14-coolercontrol'
+SYSTEM_SLEEP_HOOK = '/usr/lib/systemd/system-sleep/90-colorful-n14-acpi'
 DAEMON = '/usr/local/libexec/colorful-n14-coolercontrold'
 PLUGIN = '/usr/local/libexec/colorful-n14-custom-device'
 BINDINGS = '/etc/colorful-n14-control/profile-bindings.json'
@@ -34,7 +35,7 @@ START_ORDER = (PREPARE, SENSORS, ADAPTER, COOLER, PLUGIN_UNIT, SELECTOR)
 SENSOR_DROPINS = '/etc/systemd/system/' + SENSORS + '.d'
 REMOVABLE = SENSOR_DROPINS + '/60-active-gpu-temperature.conf'
 PATHS = (
-    PREFIX, CLIENT, DAEMON, PLUGIN, BINDINGS,
+    PREFIX, CLIENT, SYSTEM_SLEEP_HOOK, DAEMON, PLUGIN, BINDINGS,
     *('/etc/systemd/system/' + unit for unit in START_ORDER if unit != COOLER),
     '/etc/systemd/system/' + PREREQUISITE,
     *('/etc/systemd/system/' + unit + '.d' for unit in (*START_ORDER, PREREQUISITE)),
@@ -50,6 +51,7 @@ MODULES = (
 )
 SOURCES = (*MODULES, 'install.sh', 'curves.json', 'coolercontrol-config.json',
            'curve_editor.py', 'gtk_editor.py', 'run-control.sh', 'run-read-only.sh',
+           'colorful-n14-acpi.system-sleep',
            'src/adapter_client.c', 'src/transport.lua', 'coolercontrold-n14.conf',
            'configs/Colorful N14 24 - Temperature Curves - GPU Command Readback.json',
            *(unit for unit in (PREPARE, SENSORS, ADAPTER, SELECTOR)))
@@ -369,7 +371,7 @@ def stage(source, directory, plugin_dir=None, root=Path('/')):
     bundle = directory / 'source'
     for name in SOURCES:
         data = (source / name).read_text()
-        if name.endswith('.py'):
+        if name.endswith('.py') or name == 'colorful-n14-acpi.system-sleep':
             ast.parse(data, filename=name)
         copy(source / name, bundle / name)
     copy(source / 'tests', bundle / 'tests')
@@ -395,6 +397,7 @@ def stage(source, directory, plugin_dir=None, root=Path('/')):
     asset(PREFIX + '/' + profile, (bundle / profile).read_text())
     for unit in (PREPARE, SENSORS, ADAPTER, SELECTOR):
         asset('/etc/systemd/system/' + unit, (bundle / unit).read_text())
+    asset(SYSTEM_SLEEP_HOOK, (bundle / 'colorful-n14-acpi.system-sleep').read_text(), 0o755)
     config_name = layout['config_plugin_dir'] + '/config.json'
     config = location(root, config_name)
     asset(config_name, json.dumps(merge_config(json.loads(config.read_text()),

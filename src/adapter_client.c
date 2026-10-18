@@ -32,6 +32,8 @@ static int decimal_duty(const char *text) {
 static int valid(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "set-duty") == 0)
         return decimal_duty(argv[2]) >= 0;
+    if (argc == 3 && strcmp(argv[1], "keylight-set") == 0)
+        return decimal_duty(argv[2]) >= 0;
     if (argc == 3 && (strcmp(argv[1], "install-assignment") == 0 ||
                       strcmp(argv[1], "renew-assignment") == 0)) {
         size_t len = strlen(argv[2]);
@@ -47,8 +49,8 @@ static int valid(int argc, char **argv) {
     const char *actions[] = {"get-rpm", "get-duty", "temp-cpu", "temp-gpu",
                              "temp-cpu-json", "temp-gpu-json", "temp-cpu/json", "temp-gpu/json",
                              "enable", "reset", "self-check", "fence-close", "fence-close-full",
-                             "fence-status",
-                             "assignment-status"};
+                             "fence-status", "assignment-status", "keylight-get", "keylight-save",
+                             "keylight-restore", "lid-refresh"};
     for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); i++)
         if (strcmp(argv[1], actions[i]) == 0) return 1;
     return 0;
@@ -118,8 +120,9 @@ int main(int argc, char **argv) {
     if (!valid(argc, argv)) {
         fputs("usage: get-rpm|get-duty|temp-cpu|temp-gpu|temp-cpu-json|temp-gpu-json|"
               "enable|reset|self-check|temp-cpu/json|temp-gpu/json|fence-close|"
-              "fence-close-full|fence-status|assignment-status|"
-              "set-duty 0..100|set-duty-provenance 0..100 JSON\n", stderr);
+              "fence-close-full|fence-status|assignment-status|keylight-get|"
+              "keylight-save|keylight-restore|lid-refresh|set-duty 0..100|"
+              "keylight-set 0..100|set-duty-provenance 0..100 JSON\n", stderr);
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -177,7 +180,8 @@ int main(int argc, char **argv) {
             strcmp(argv[1], "get-rpm") == 0 || strcmp(argv[1], "get-duty") == 0 ||
             strcmp(argv[1], "temp-cpu") == 0 || strcmp(argv[1], "temp-gpu") == 0 ||
             strcmp(argv[1], "temp-cpu-json") == 0 || strcmp(argv[1], "temp-gpu-json") == 0 ||
-            strcmp(argv[1], "fence-status") == 0 || strcmp(argv[1], "assignment-status") == 0)
+            strcmp(argv[1], "fence-status") == 0 || strcmp(argv[1], "assignment-status") == 0 ||
+            strcmp(argv[1], "keylight-get") == 0)
             fputs(reply + 3, stdout);
         return 0;
     }
