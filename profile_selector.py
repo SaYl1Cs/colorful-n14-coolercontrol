@@ -190,7 +190,7 @@ class ProfileSelector:
                 live = self._live()
                 data = thermal_state.read_snapshot(self.snapshot_path, now=now,
                                                    require_metadata=True, require_samples=True)
-                _require(not thermal_state.critical_temperature(data))
+                # Temperature demand must not revoke the control assignment.
                 epoch = thermal_state.epoch(data)
                 role = 'cpu' if thermal_state.requested_curve(data) == 'cpu' else 'mix'
                 uid = self.bindings['profiles'][role]
@@ -209,7 +209,8 @@ class ProfileSelector:
                 closed = self.rpc.handover(live)
                 _require(type(closed) is dict and closed.get('phase') == 'closed'
                          and type(closed.get('close_id')) is str)
-                if closed.get('full_confirmed') is not True:
+                if (closed.get('full_confirmed') is not True and
+                        closed.get('override_disabled') is not True):
                     provenance_fence.check_hold(closed)
                     _require(closed['hold_kind'] == 'handover' and closed['hold_epoch'] == epoch)
                 target = self.bindings['target']

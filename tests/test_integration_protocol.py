@@ -41,11 +41,12 @@ class FlowTests(unittest.TestCase):
         self.h.select()
         self.assertEqual(len(self.h.api.puts), count + 2)
 
-    def test_full_fallback_even_when_fence_storage_fails(self):
+    def test_close_storage_failure_never_writes_fans(self):
         self.h.select()
         with patch.object(fence, 'close', side_effect=OSError('fixture filesystem failure')):
             self.assertTrue(server.dispatch('reset').startswith(b'ERR'))
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        self.assertFalse(fence.status()['full_confirmed'])
+        self.assertTrue(fence.status()['override_disabled'])
 
     def test_bound_capture_only_reads_catalog_and_preserves_graphs(self):
         from capture_profile_bindings import capture
@@ -93,7 +94,8 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(self.h.send(sleep_command).startswith(b'OK'))
         self.h.sleep = False  # Wake before the sampler has published the new mode
         self.assertTrue(self.h.send(self.h.api.command()).startswith(b'ERR'))
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        self.assertFalse(fence.status()['full_confirmed'])
+        self.assertTrue(fence.status()['override_disabled'])
         self.h.advance()
         self.assertEqual(self.h.select(), 'mix')
         self.assertEqual(fence.status()['phase'], 'awaiting')
@@ -108,9 +110,10 @@ class FlowTests(unittest.TestCase):
         with patch.object(adapter, 'read_live_power_state', side_effect=RuntimeError('resuming')):
             self.assertTrue(self.h.send(command).startswith(b'ERR'))
         self.assertEqual(fence.status()['phase'], 'closed')
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        self.assertFalse(fence.status()['full_confirmed'])
+        self.assertTrue(fence.status()['override_disabled'])
 
-    def test_watchdog_transient_holds_but_stale_data_and_lease_loss_force_full(self):
+    def test_watchdog_transient_holds_then_closes_without_override(self):
         for fault in ('missing', 'stale', 'error', 'transition', 'lease'):
             self.h.snapshot()
             self.h.select()
@@ -139,7 +142,8 @@ class FlowTests(unittest.TestCase):
                 fence.check_hold(fence.status())
                 continue
             self.assertEqual(fence.status()['phase'], 'closed', fault)
-            self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+            self.assertFalse(fence.status()['full_confirmed'])
+            self.assertTrue(fence.status()['override_disabled'])
 
     def test_producer_sampler_selector_and_adapter_restarts(self):
         self.h.select()
@@ -281,7 +285,7 @@ class FlowTests(unittest.TestCase):
     def test_actual_duty_is_recorded_only_after_both_fans_succeed(self):
         self.h.select()
         def still_full(*args):
-            self.assertEqual(fence.status()['last_duty'], 100)
+            self.assertIsNone(fence.status()['last_duty'])
             self.assertGreater(fence.status()['last_calculation_id'], 0)
         with patch.object(adapter, 'write_raw', side_effect=still_full) as writes:
             self.assertTrue(self.h.send(self.h.api.command(duty=5, gpu_duty=6)).startswith(b'OK'))
@@ -310,9 +314,10 @@ class FlowTests(unittest.TestCase):
                 self.h.watchdog.tick()
         self.assertIn('producer output absent', errors.getvalue())
         self.assertEqual(fence.status()['phase'], 'closed')
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        self.assertFalse(fence.status()['full_confirmed'])
+        self.assertTrue(fence.status()['override_disabled'])
 
-    def test_awaiting_first_provenance_stays_full_and_still_times_out(self):
+    def test_awaiting_first_provenance_keeps_unknown_duty_and_times_out(self):
         self.h.select()
         self.h.cpu = 85000
         for _ in range(16):
@@ -322,7 +327,7 @@ class FlowTests(unittest.TestCase):
             self.h.watchdog.tick()
             self.h.writes.assert_not_called()
             self.assertEqual(fence.status()['phase'], 'awaiting')
-            self.assertEqual(fence.status()['last_duty'], 100)
+            self.assertIsNone(fence.status()['last_duty'])
         self.h.advance(8)  # 67s transition + 100s first-output allowance expired.
         with redirect_stderr(io.StringIO()) as errors:
             self.h.watchdog.tick()
@@ -340,9 +345,10 @@ class FlowTests(unittest.TestCase):
             self.assertTrue(self.h.send(command).startswith(b'ERR'))
         self.assertEqual(errors.getvalue(), 'Adapter request rejected [set-duty-provenance]: replayed/out-of-order command\n')
         self.assertEqual(fence.status()['phase'], 'closed')
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        self.assertFalse(fence.status()['full_confirmed'])
+        self.assertTrue(fence.status()['override_disabled'])
 
-    def test_local_rise_pm_races_at_all_three_observations_force_full(self):
+    def test_local_rise_pm_races_at_all_three_observations_revoke_without_writes(self):
         for changed_at in range(3):
             with self.subTest(changed_at=changed_at):
                 self.h.cpu = 61000
@@ -356,12 +362,10 @@ class FlowTests(unittest.TestCase):
                 with patch.object(adapter, 'read_live_power_state', side_effect=states):
                     self.h.watchdog.tick()
                 self.assertEqual(fence.status()['phase'], 'closed')
-                self.assertTrue(fence.status()['full_confirmed'])
-                self.assertEqual([c.args for c in self.h.writes.call_args_list],
-                                 [(adapter.MODE, 2), (adapter.CPU_TARGET, adapter.MAX_RAW),
-                                  (adapter.GPU_TARGET, adapter.MAX_RAW)])
+                self.assertFalse(fence.status()['full_confirmed'])
+                self.h.writes.assert_not_called()
 
-    def test_local_rise_partial_write_or_duty_record_failure_closes_and_forces_full(self):
+    def test_local_rise_partial_write_or_record_failure_closes_without_retry(self):
         for fault in ('write', 'exit', 'record'):
             with self.subTest(fault=fault):
                 self.h.cpu = 61000
@@ -383,20 +387,24 @@ class FlowTests(unittest.TestCase):
                         patch.object(fence, 'record_applied_duty', side_effect=fail_record):
                     self.h.watchdog.tick()
                 self.assertEqual(fence.status()['phase'], 'closed')
-                self.assertTrue(fence.status()['full_confirmed'])
-                self.assertEqual([c.args for c in writes.call_args_list[-3:]],
-                                 [(adapter.MODE, 2), (adapter.CPU_TARGET, adapter.MAX_RAW),
-                                  (adapter.GPU_TARGET, adapter.MAX_RAW)])
+                self.assertFalse(fence.status()['full_confirmed'])
+                self.assertEqual(writes.call_count, 3)
+                for call in writes.call_args_list:
+                    if call.args[0] != adapter.MODE:
+                        self.assertLess(call.args[1], adapter.MAX_RAW)
+                with self.assertRaisesRegex(ValueError, 'last applied duty uncertain'):
+                    adapter.check_applied_duty()
 
-    def test_failed_record_and_close_cannot_turn_full_fallback_into_unproven_lower(self):
+    def test_failed_record_and_close_do_not_trigger_additional_fan_writes(self):
         for entrypoint in ('watchdog', 'producer', 'full'):
             with self.subTest(entrypoint=entrypoint):
                 self.h.cpu = 61000
                 self.h.advance()
                 self.h.select()
-                self.h.send(self.h.api.command(duty=5, gpu_duty=6))
+                self.assertTrue(self.h.send(self.h.api.command(duty=5, gpu_duty=6)).startswith(b'OK'))
                 self.h.cpu = 62000
                 self.h.advance()
+                self.h.writes.reset_mock()
                 with patch.object(fence, '_atomic', side_effect=OSError('offline disk failure')), \
                         redirect_stderr(io.StringIO()):
                     if entrypoint == 'watchdog':
@@ -405,23 +413,26 @@ class FlowTests(unittest.TestCase):
                         self.assertTrue(self.h.send(self.h.api.command(duty=5, gpu_duty=6)).startswith(b'ERR'))
                     else:
                         self.assertTrue(server.dispatch('set-duty 100').startswith(b'ERR'))
-                # Stale persisted state still says 71, but full was commanded.
-                self.assertEqual(fence.status()['phase'], 'active')
+                # Only the original requested write may have happened. There is
+                # no emergency retry, whether storage failed before or after it.
+                self.assertEqual(self.h.writes.call_count, 0 if entrypoint == 'producer' else 3)
+                if self.h.writes.call_count:
+                    expected = adapter.MAX_RAW if entrypoint == 'full' else adapter.MIN_COMMAND + round(72 * 69 / 100)
+                    self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, expected))
                 self.assertEqual(fence.status()['last_duty'], 71)
-                self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
                 with self.assertRaisesRegex(ValueError, 'last applied duty uncertain'):
                     adapter.check_applied_duty()
                 self.h.advance()
                 self.h.writes.reset_mock()
                 self.h.watchdog.tick()
-                self.assertEqual([c.args for c in self.h.writes.call_args_list],
-                                 [(adapter.MODE, 2), (adapter.CPU_TARGET, adapter.MAX_RAW),
-                                  (adapter.GPU_TARGET, adapter.MAX_RAW)])
+                self.h.writes.assert_not_called()
                 self.assertEqual(fence.status()['phase'], 'closed')
-                self.assertTrue(fence.status()['full_confirmed'])
-                adapter.check_applied_duty()  # Successful full clears uncertainty.
+                # Only a genuinely fresh validated command clears uncertainty.
+                self.h.select()
+                self.assertTrue(self.h.send().startswith(b'OK'))
+                adapter.check_applied_duty()
 
-    def test_critical_temperatures_still_force_full_in_cpu_and_max_modes(self):
+    def test_high_temperatures_keep_curves_and_assignment_working(self):
         for sleep, sensor, temperature in ((True, 'cpu', 90000), (False, 'cpu', 90000),
                                            (False, 'gpu', 80000)):
             with self.subTest(sleep=sleep, sensor=sensor):
@@ -429,13 +440,17 @@ class FlowTests(unittest.TestCase):
                 try:
                     h.select()
                     h.send(h.api.command(duty=5, gpu_duty=6))
+                    h.writes.reset_mock()
                     setattr(h, sensor, temperature)
                     h.advance()
                     with redirect_stderr(io.StringIO()) as errors:
                         h.watchdog.tick()
-                    self.assertIn('critical temperature', errors.getvalue())
-                    self.assertEqual(fence.status()['phase'], 'closed')
-                    self.assertEqual(h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+                    self.assertEqual(errors.getvalue(), '')
+                    self.assertEqual(fence.status()['phase'], 'active')
+                    self.assertEqual(fence.status()['last_duty'],
+                                     control_policy.curve_demand(h.policy(), h.data))
+                    self.assertTrue(h.send(h.api.command(100, 100)).startswith(b'OK'))
+                    self.assertEqual(fence.status()['last_duty'], 100)
                 finally:
                     h.close()
 
@@ -458,10 +473,7 @@ class FlowTests(unittest.TestCase):
                         'set-duty-provenance 42 {"schema":1,"schema":1}',
                         'set-duty-provenance 42 NaN', 'enable\nset-duty 1'):
             self.assertTrue(server.dispatch(request).startswith(b'ERR'))
-        # Invalid provenance may request full, but never a low write.
-        for call in self.h.writes.call_args_list[count:]:
-            if call.args[0] in (adapter.CPU_TARGET, adapter.GPU_TARGET):
-                self.assertEqual(call.args[1], adapter.MAX_RAW)
+        self.assertEqual(self.h.writes.call_count, count)
 
     def test_original_json_values_identity_and_unavailable_gpu(self):
         cpu = json.loads(server.dispatch('temp-cpu/json')[3:])
@@ -516,7 +528,8 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(reply, b'ERR adapter request rejected\n')
             self.assertEqual(errors.getvalue(), 'Adapter request rejected [set-duty-provenance]: ' + reason + '\n')
             self.assertEqual(fence.status()['phase'], 'closed')
-            self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+            self.assertFalse(fence.status()['full_confirmed'])
+            self.assertTrue(fence.status()['override_disabled'])
 
     def test_watchdog_logs_bounded_reason_never_arbitrary_exception_text(self):
         secret = 'SECRET\nAuthorization: Bearer token\x1b[31m' * 10000
@@ -533,7 +546,7 @@ class DiagnosticTests(unittest.TestCase):
             with self.subTest(reason=reason), redirect_stderr(io.StringIO()) as errors, \
                     patch.object(server, 'read_snapshot', side_effect=error):
                 server.ThermalWatchdog().tick()
-                self.assertEqual(errors.getvalue(), 'Fan watchdog: ' + reason + '; requesting full duty\n')
+                self.assertEqual(errors.getvalue(), 'Fan watchdog: ' + reason + '; invalidating control without fan override\n')
                 self.assertLess(len(errors.getvalue()), 240)
                 self.assertEqual(fence.status()['phase'], 'closed')
 
@@ -546,8 +559,8 @@ class DiagnosticTests(unittest.TestCase):
                 self.h.advance()
                 self.h.watchdog.tick()
         self.assertEqual(errors.getvalue().splitlines(), [
-            'Fan watchdog: temperature snapshot stale or invalid; requesting full duty',
-            'Fan watchdog: selector lease expired; requesting full duty'])
+            'Fan watchdog: temperature snapshot stale or invalid; invalidating control without fan override',
+            'Fan watchdog: selector lease expired; invalidating control without fan override'])
 
     def test_dispatch_does_not_log_untrusted_decoder_or_captured_stderr(self):
         for request, action, reason in (('set-duty-provenance 5 {"SECRET":"token",', 'set-duty-provenance', 'invalid JSON'),
@@ -681,8 +694,9 @@ class CompiledSocketTests(unittest.TestCase):
         self.assertEqual(self.h.writes.call_count, count)
         result = self.client('fence-close-full')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(json.loads(result.stdout)['full_confirmed'])
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        self.assertFalse(json.loads(result.stdout)['full_confirmed'])
+        self.assertTrue(json.loads(result.stdout)['override_disabled'])
+        self.assertEqual(self.h.writes.call_count, count)
 
     def test_partial_slow_client_does_not_block_watchdog(self):
         self.h.select()

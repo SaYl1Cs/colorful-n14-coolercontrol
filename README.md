@@ -1,5 +1,10 @@
 # COLORFUL N14 24 — EC cooling with CoolerControl
 
+**Current error policy: no automatic emergency fan override.** Sensor/control
+errors revoke command authority without setting any replacement speed. A stopped
+fan can remain stopped during a prolonged failure. This is not a thermal-safety
+guarantee. See [exact behavior and risks](NO-EMERGENCY-OVERRIDE.md).
+
 Experimental, model-specific fan control that reads CPU/GPU temperatures from the
 embedded controller (EC), without periodically waking the NVIDIA GPU through NVML.
 
@@ -31,7 +36,8 @@ fan-control register addresses.
 | PCI D0 **and** runtime active, valid EC readings | Maximum of CPU and GPU graph outputs |
 | GPU asleep | No GPU temperature measurement is published |
 | Brief sensor loss | Bounded hold of the last validated fan setting |
-| Overtemperature, persistent sensor loss or control failure | Protective full-duty request |
+| Valid high temperature | Continue the existing curve, including its configured 100% output |
+| Persistent sensor loss or control failure | Reject/revoke invalid control; no replacement fan command |
 
 CPU is never substituted as GPU temperature. A sleeping GPU is not reported as
 0 degrees C. Its temperature endpoint returns `GPU_ASLEEP`; the plugin omits the
@@ -54,13 +60,15 @@ The logical `both_fans` channel controls both physical fans:
 
 Normal handover can preserve validated individual fan targets for **up to 10
 seconds**, without restarting that deadline on retries. A thermal-only sensor gap
-can hold the last setting only while the required readings have a **total age
-under 5 seconds**. It does not freeze zero/low fan settings indefinitely.
+can retain authority only while the required readings have a **total age
+under 5 seconds**. After expiry the assignment is closed without changing speed;
+zero/low fan settings may therefore remain indefinitely until valid control resumes.
 
 Confirmed orderly system shutdown is distinguished from a manual stop/crash.
-Overtemperature, failed fan writes, invalid control data and expired holds retain
-protection. Actual reboot acoustics and firmware behavior before Linux starts
-have **not** been validated. Details: [QUIET-LIFECYCLE.md](QUIET-LIFECYCLE.md).
+Neither now forces full fan duty. Overtemperature, failed writes, invalid control
+data and expired holds revoke authority without an emergency speed override.
+Actual reboot acoustics and firmware behavior before Linux starts have **not**
+been validated. Details: [current policy](NO-EMERGENCY-OVERRIDE.md).
 
 ## Components
 
@@ -87,9 +95,10 @@ minimum or a timing guarantee on other firmware.
 
 The transaction runs inside the existing serial root-only adapter. It restores
 both individual fan targets only while fresh thermal/provenance checks still
-authorize them; otherwise it requests protective full duty and fences old
-commands. Curves, leases, sample clocks and critical-temperature protections are
-not relaxed. See [sleep coordination and validation](SLEEP-COORDINATION.md).
+authorize them; otherwise it fences old commands without an emergency write and
+leaves the already selected automatic firmware mode alone. Curves, leases,
+sample clocks and input validation are not relaxed.
+See [sleep coordination and validation](SLEEP-COORDINATION.md).
 
 The installed client supports:
 

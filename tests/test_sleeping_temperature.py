@@ -84,7 +84,7 @@ class SleepingTemperatureTests(unittest.TestCase):
 
     def test_sleep_status_cannot_bypass_control_error_handling(self):
         with patch.object(server, '_rpc', side_effect=adapter.GpuAsleep()), \
-                patch.object(server, '_full_hand_over') as full, \
+                patch.object(server, '_close_without_override') as full, \
                 redirect_stderr(io.StringIO()) as log:
             result = server.dispatch('set-duty-provenance 0 {}')
         full.assert_called_once()

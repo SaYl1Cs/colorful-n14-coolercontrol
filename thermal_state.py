@@ -147,13 +147,8 @@ def read_cpu_snapshot_data(data, now=None, require_metadata=False, require_sampl
 def read_snapshot_data(data, now=None, require_metadata=False, require_samples=False,
                        now_unix_ms=None):
     now = boottime() if now is None else now
-    # A hot available sensor overrides even a simultaneous loss of the other.
-    if (type(data) is dict and (require_metadata and require_samples or
-            data.get('errors') or data.get('cpu_temp') is None or
-            data.get('gpu_state') == 'active' and data.get('gpu_temp') is None) and
-            any(finite(data.get(role + '_temp')) and data[role + '_temp'] >= limit
-                for role, limit in (('cpu', 90000), ('gpu', 80000)))):
-        raise ValueError('critical temperature')
+    # A valid high temperature is a measurement, not a sensor/protocol error.
+    # Keep publishing it so existing curves can request their configured duty.
     _common(data, now, require_metadata, require_samples, now_unix_ms)
     if data.get('gpu_state') == 'active':
         stamp = data.get('gpu_sampled_at')

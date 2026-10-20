@@ -1,5 +1,8 @@
 # N14 sleep, keyboard lighting and cooling coordination
 
+> **Emergency fan-speed overrides are now removed.** The current failure policy
+> is documented in [NO-EMERGENCY-OVERRIDE.md](NO-EMERGENCY-OVERRIDE.md).
+
 ## Supported platform and confirmed observations
 
 Only the platform already guarded by [coolercontrol_adapter.py](coolercontrol_adapter.py)
@@ -50,15 +53,15 @@ PCI power state, current provenance/authority and matching last applied targets.
 Individual bounded holds retain their original deadlines and must satisfy their
 existing thermal/policy checks. A required transition rise, expired hold,
 critical temperature, stale sample, uncertain last duty or unconfirmed GPU
-power state cannot be hidden by a lighting operation. Unverifiable targets use
-protective full duty and close the previous command fence. No lease, producer
-calculation ID or sensor timestamp is refreshed by restoring the same targets.
+power state cannot be hidden by a lighting operation. Unverifiable targets close
+the previous command fence without restoring stale targets or issuing a full-duty
+command. The already selected firmware automatic mode is left alone. No lease,
+producer calculation ID or sensor timestamp is refreshed by this failure path.
 
-A partial firmware/write failure requests the existing best-effort full-duty
-safety path. The backend remains the owner; a timed-out hook client must not
-kill it. Firmware calls themselves are not hard-real-time operations. The
-cooling algorithms, curves and critical-temperature protections remain active;
-removing a diagnostic test cutoff did not remove production protection.
+A partial firmware/write failure invalidates authority without emergency retries.
+The backend remains the owner; a timed-out hook client must not kill it. Firmware
+calls themselves are not hard-real-time operations. Saved curves and firmware
+protections are not modified, but software emergency cooling is no longer provided.
 
 ## Exact one-shot brightness state
 

@@ -76,7 +76,7 @@ class KeylightTransactionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(adapter, 'write_raw', side_effect=self.hw.write))
         self.stack.enter_context(patch.object(adapter, 'acpi', side_effect=self.hw.acpi))
         self.stack.enter_context(patch.object(adapter.time, 'sleep', side_effect=self.hw.sleep))
-        self.emergency = self.stack.enter_context(patch.object(adapter, '_failed_write_full'))
+        self.emergency = self.stack.enter_context(patch.object(adapter, '_invalidate_failed_write'))
 
     def test_manual_full_transaction_has_exactly_one_pre_delay_and_restores_both_targets(self):
         self.assertEqual(adapter.set_key_brightness(50), 50)
@@ -124,14 +124,14 @@ class KeylightTransactionTests(unittest.TestCase):
             adapter.set_key_brightness(50)
         self.assertEqual(self.hw.events, [])
 
-    def test_lighting_failure_requests_emergency_full_and_does_not_save(self):
+    def test_lighting_failure_invalidates_without_saving(self):
         self.hw.light_result = 1
         with self.assertRaises(SystemExit):
             adapter.set_key_brightness(50)
         self.emergency.assert_called_once()
         self.assertFalse(self.path.exists())
 
-    def test_fan_return_failure_requests_emergency_full(self):
+    def test_fan_return_failure_invalidates_without_emergency_write(self):
         self.hw.fail_fan_index = adapter.CPU_TARGET
         with self.assertRaises(OSError):
             adapter.set_key_brightness(50)
@@ -248,14 +248,13 @@ class LightingCoolingIntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter._keylight_fan_targets((wrong, wrong))
 
-    def test_expired_samples_force_full_not_stale_low_targets(self):
+    def test_expired_samples_revoke_authority_without_restoring_or_forcing_targets(self):
         self.h.advance(20, sample=False)
         self.h.writes.reset_mock()
-        with patch.object(adapter, 'read_raw', return_value=70):
-            adapter._keylight_return_fans((self.raw, self.raw))
-        self.assertEqual(self.h.writes.call_args_list, [call(adapter.MODE, 2),
-                         call(adapter.CPU_TARGET, 70), call(adapter.GPU_TARGET, 70)])
-        self.assertTrue(fence.status()['full_confirmed'])
+        adapter._keylight_return_fans((self.raw, self.raw))
+        self.h.writes.assert_not_called()
+        self.assertFalse(fence.status()['full_confirmed'])
+        self.assertTrue(fence.status()['override_disabled'])
         self.assertEqual(fence.status()['phase'], 'closed')
 
     def test_transition_requiring_higher_duty_rejects_restore_of_low_targets(self):

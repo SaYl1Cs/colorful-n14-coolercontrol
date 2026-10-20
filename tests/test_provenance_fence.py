@@ -19,6 +19,7 @@ class ProvenanceFenceTests(unittest.TestCase):
         command = self.h.api.command()
         self.assertEqual(self.validate(command), 80)
         self.assertEqual(fence.accept_command(command, current_snapshot=self.h.data), 80)
+        fence.record_applied_duty(80)  # Serial writer records completion after reservation.
         with self.assertRaisesRegex(ValueError, 'replayed'):
             self.validate(command)
 

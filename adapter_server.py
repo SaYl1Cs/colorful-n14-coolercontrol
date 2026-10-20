@@ -40,7 +40,7 @@ def shutdown_confirmed():
     """At reset/finalization only; <=1s total, no shell or per-loop subprocess.
 
     Cache positive evidence for at most 10s, never a generic SIGTERM or caller
-    flag. A failed/ambiguous systemd query retains manual-stop/full semantics.
+    flag. A failed query closes authority without changing the fan setting.
     """
     global _STOPPING_UNTIL
     now = thermal_state.boottime()
@@ -72,32 +72,28 @@ def shutdown_confirmed():
         return False
 
 
-def _full_hand_over():
+def _close_without_override():
+    """Invalidate stale control authority without changing fan duty."""
     adapter.forget_safe()
-    try:
-        fence.close()
-    finally:
-        # Still attempt full on a state-storage failure; never report a
-        # successful hand-over when closing or persisting confirmation failed.
-        adapter.fixed_full()
-    return fence.mark_full()
+    return fence.close()
 
 
 def _bounded_hand_over(live_policy=None, *, startup=False, shutdown=False):
     try:
         return adapter.quiet_hand_over(live_policy, startup=startup, shutdown=shutdown)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit):
-        return _full_hand_over()
+        return _close_without_override()
 
 
 def _lifecycle_stop():
     if shutdown_confirmed():
         return _bounded_hand_over(shutdown=True)
-    return _full_hand_over()
+    return _close_without_override()
 
 
 def _sensor_check():
-    # Never trust a selector's claim of sensor loss as authority to bypass full.
+    # The adapter independently validates sensor loss; the caller cannot renew
+    # stale provenance. Failure never causes a replacement fan command.
     try:
         data = adapter.current_control_snapshot()
     except thermal_state.SensorUnavailable:
@@ -105,9 +101,9 @@ def _sensor_check():
             previous = adapter.sensor_grace()
             return dict(fence.status(), sensor_grace_until=adapter.sensor_grace_deadline(previous))
         except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit):
-            return _full_hand_over()
+            return _close_without_override()
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit):
-        return _full_hand_over()
+        return _close_without_override()
     # A recovery raced the selector: let the next iteration assign, but do not
     # prolong an existing handover or rescue an expired/unknown state.
     return _bounded_hand_over()
@@ -116,7 +112,9 @@ def _sensor_check():
 def _rpc(request):
     action, sep, payload = request.partition(' ')
     if action == 'fence-close-full' and not sep:
-        return _full_hand_over()
+        # Legacy wire name retained for existing selector/client compatibility.
+        # It now only revokes authority, with no implicit full-duty write.
+        return _close_without_override()
     if action in ('reset', 'lifecycle-stop') and not sep:
         return _lifecycle_stop()
     if action == 'sensor-check' and not sep:
@@ -190,7 +188,7 @@ def dispatch(request):
             return b'ERR GPU_ASLEEP: D3cold; temperature unavailable\n'
         # This status must never exempt a control request from protection.
         try:
-            _full_hand_over()
+            _close_without_override()
         except (OSError, ValueError, RuntimeError, SystemExit):
             pass
         print('Adapter request rejected: unexpected GPU-asleep status', file=sys.stderr, flush=True)
@@ -201,7 +199,7 @@ def dispatch(request):
         if type(request) is str and request.split(' ', 1)[0] in (
                 'set-duty-provenance', 'set-duty', 'install-assignment', 'renew-assignment', 'fence-handover'):
             try:
-                _full_hand_over()
+                _close_without_override()
             except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit):
                 pass
         # Log only an allowlisted action and source-owned reason; never payloads.
@@ -238,8 +236,6 @@ class ThermalWatchdog:
                 return  # No writes, no renewed lease, no refreshed sample timestamp.
             if adapter.read_live_power_state() != (data['gpu_state'], data['gpu_power_state']):
                 raise ValueError('current power mode mismatch')
-            if thermal_state.critical_temperature(data):
-                raise ValueError('critical temperature')
             adapter.check_applied_duty()
             status = fence.status()
             if status['phase'] != 'closed':
@@ -255,20 +251,20 @@ class ThermalWatchdog:
                 else:
                     adapter.raise_hold_floor(data)
                 adapter.remember_safe(data)
-            elif status.get('full_confirmed') is not True:
-                raise ValueError('fence is closed without full duty')
+            # A closed fence needs no full-duty confirmation: it authorizes no
+            # producer writes until a new authenticated assignment is installed.
             self.failed = False
             self.failure_reason = None
         except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit) as exc:
             reason = fence.rejection_reason(exc)
             if not self.failed or reason != self.failure_reason:
-                print('Fan watchdog: ' + reason + '; requesting full duty', file=sys.stderr, flush=True)
+                print('Fan watchdog: ' + reason + '; invalidating control without fan override',
+                      file=sys.stderr, flush=True)
             self.failed = True
             self.failure_reason = reason
-            # Emergency full must never use the planned-shutdown exception.
-            # Repeat failed writes once a second; stale callbacks stay fenced.
-            if dispatch('fence-close-full').startswith(b'ERR'):
-                print('Fan watchdog: full-duty request failed', file=sys.stderr, flush=True)
+            # Fail closed at the control/provenance layer, but never force a
+            # 100% fan command as automatic failure handling.
+            dispatch('fence-close')
 
 
 class SocketLoop:
@@ -351,8 +347,8 @@ def serve():
         def stop(*_):
             nonlocal stopping
             stopping = True
-        # Install handlers before any quiet hold; a manual SIGTERM during socket
-        # setup must still reach full-duty cleanup rather than leave fixed fans.
+        # Install handlers before setup so even an early stop revokes stale
+        # authority. Finalization never overrides the current fan setting.
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, stop)
         try:
@@ -379,9 +375,9 @@ def serve():
                 orderly = False
                 raise
             finally:
-                # Setup failures and crashes always full, even during shutdown.
-                if dispatch('lifecycle-stop' if orderly else 'fence-close-full').startswith(b'ERR'):
-                    print('Adapter shutdown: full-duty request failed', file=sys.stderr, flush=True)
+                # Revoke authority on setup failures/crashes, without fan writes.
+                if dispatch('lifecycle-stop' if orderly else 'fence-close').startswith(b'ERR'):
+                    print('Adapter shutdown: control invalidation failed', file=sys.stderr, flush=True)
                 if bound:
                     SOCKET.unlink(missing_ok=True)
     return 0

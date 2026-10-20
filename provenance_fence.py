@@ -32,7 +32,7 @@ SAFE_REJECTION_REASONS = frozenset({
     'provenance rejected', 'invalid provenance members', 'invalid fence state',
     'invalid producer schema', 'invalid producer session UUID', 'invalid assignment counters',
     'invalid identifier', 'invalid live cooling policy', 'bound sensor source changed',
-    'hand-over superseded or not full', 'thermal epoch changed during PUT',
+    'hand-over superseded or not full', 'hand-over superseded or not closed', 'thermal epoch changed during PUT',
     'assignment target mismatch', 'assignment inappropriate for power mode', 'stale assignment response',
     'critical temperature', 'fence closed', 'sampler epoch/mode changed', 'selector lease expired',
     'producer output absent', 'no valid first calculation', 'renewal identity mismatch',
@@ -64,7 +64,7 @@ SAFE_REJECTION_REASONS = frozenset({
 
 def rejection_reason(error):
     """Bounded diagnostic, not arbitrary exception/cause or caller text."""
-    if type(error) is ValueError and error.args == ('lower-duty validation failed; full duty requested',):
+    if type(error) is ValueError and error.args == ('lower-duty validation failed; no fan override',):
         error = error.__cause__
     if type(error) in (ValueError, RuntimeError, thermal.SensorUnavailable) and len(error.args) == 1 and type(error.args[0]) is str:
         if error.args[0] in SAFE_REJECTION_REASONS:
@@ -110,7 +110,9 @@ def _read(path=None):
 
 
 def close(path=None):
-    _atomic(path, {'phase': 'closed', 'close_id': str(uuid.uuid4()), 'full_confirmed': False})
+    """Revoke command authority without writing or claiming a known fan duty."""
+    _atomic(path, {'phase': 'closed', 'close_id': str(uuid.uuid4()),
+                   'full_confirmed': False, 'override_disabled': True})
     return status(path)
 
 
@@ -164,7 +166,7 @@ def status(path=None):
         state = _read(path)
     except (OSError, ValueError):
         return {'phase': 'closed', 'full_confirmed': False}
-    return {k: state[k] for k in ('phase', 'close_id', 'full_confirmed', 'assignment',
+    return {k: state[k] for k in ('phase', 'close_id', 'full_confirmed', 'override_disabled', 'assignment',
                                  'epoch', 'policy_digest', 'lease_until', 'last_calculation_id',
                                  'last_duty', 'transition_until', *HOLD_KEYS) if k in state}
 
@@ -195,8 +197,9 @@ def install_assignment(response, live_policy, expected_epoch, close_id, current_
         check_hold(state, now)
         require(state['hold_kind'] == 'handover' and
                 state['hold_epoch'] == expected_epoch, 'thermal epoch changed during PUT')
-    require(state['phase'] == 'closed' and (held or state.get('full_confirmed') is True)
-            and state.get('close_id') == close_id, 'hand-over superseded or not full')
+    require(state['phase'] == 'closed' and (held or state.get('full_confirmed') is True
+            or state.get('override_disabled') is True) and state.get('close_id') == close_id,
+            'hand-over superseded or not closed')
     require(expected_epoch == thermal.epoch(current_snapshot), 'thermal epoch changed during PUT')
     target = live_policy['bindings']['target']
     require(response['device_uid'] == target['device_uid']
@@ -210,7 +213,8 @@ def install_assignment(response, live_policy, expected_epoch, close_id, current_
                  lease_until=now + SELECTOR_LEASE, installed_at=now,
                  transition_until=now + policy.transition_seconds(live_policy),
                  last_calculation_id=0, last_output_at=None,
-                 last_duty=min((v - 1) * 100 // 69 for v in state['held_raw']) if held else 100)
+                 last_duty=min((v - 1) * 100 // 69 for v in state['held_raw']) if held
+                 else 100 if state.get('full_confirmed') is True else None)
     if held:
         state['hold_policy'] = live_policy
     _atomic(path, state)
@@ -221,7 +225,7 @@ def check_current(state, current, now=None, now_ms=None):
     now = thermal.boottime() if now is None else now
     wall = thermal.unix_ms() if now_ms is None else now_ms
     thermal.read_snapshot_data(current, now, True, True, wall)
-    require(not thermal.critical_temperature(current), 'critical temperature')
+    # High but valid temperatures remain usable control inputs.
     check_authority(state, now)
     require(state['epoch'] == thermal.epoch(current), 'sampler epoch/mode changed')
     return state
@@ -231,7 +235,9 @@ def check_authority(state, now=None):
     """Health independent of sensor availability; grace must not hide expiry."""
     now = thermal.boottime() if now is None else now
     require(state.get('phase') in ('awaiting', 'active'), 'fence closed')
-    require(thermal.integer(state.get('last_duty'), 0, 100), 'invalid last applied duty')
+    require(thermal.integer(state.get('last_duty'), 0, 100) or
+            state['phase'] == 'awaiting' and state.get('override_disabled') is True
+            and state.get('last_duty') is None, 'invalid last applied duty')
     if 'hold_until' in state:
         check_hold(state, now)
     require(0 <= state['lease_until'] - now <= SELECTOR_LEASE, 'selector lease expired')
@@ -395,7 +401,8 @@ def record_applied_duty(duty, path=None):
 def watchdog_check(current, path=None, now=None):
     """Validate current health; same-epoch demand rises do not revoke assignment."""
     state = check_current(_read(path), current, now)
-    require(thermal.integer(state['last_duty'], 0, 100), 'invalid last applied duty')
+    # Awaiting a first validated write may legitimately have unknown duty.
+    # check_current/check_authority already validate that specific state.
     return state
 
 

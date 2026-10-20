@@ -85,7 +85,8 @@ class API:
         assert method == 'PUT' and path == '/devices/ec/settings/both_fans/profile'
         state = fence.status()
         assert state['phase'] == 'closed'
-        if state.get('full_confirmed') is not True:
+        if (state.get('full_confirmed') is not True and
+                state.get('override_disabled') is not True):
             fence.check_hold(state)
             assert state['hold_kind'] == 'handover'
         self.applied = body['profile_uid']

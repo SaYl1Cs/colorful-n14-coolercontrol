@@ -505,8 +505,12 @@ def health_sample():
             and assignment['channel_name'] == bindings['target']['channel_name']
             and state['policy_digest'] == control_policy.fingerprint(policy),
             'selector/live assignment or policy mismatch')
-    require(state['full_confirmed'] is True and
-            (state['phase'] == 'active' or state['last_duty'] == 100), 'awaiting fence must retain full duty')
+    # A healthy assignment no longer requires a forced-full command. Awaiting
+    # can have unknown duty; active must have a successfully recorded command.
+    require((state['phase'] == 'active' and thermal.integer(state.get('last_duty'), 0, 100))
+            or (state['phase'] == 'awaiting' and
+                (state.get('override_disabled') is True or state.get('full_confirmed') is True
+                 or 'hold_until' in state)), 'invalid awaiting/active duty state')
     return dict(identity=[thermal.epoch(current), assignment], sample=current['sample_id'],
                 lease=state['lease_until'], phase=state['phase'])
 

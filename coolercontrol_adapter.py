@@ -288,13 +288,10 @@ def _keylight_return_fans(targets):
     try:
         targets = _keylight_fan_targets(targets)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, SystemExit):
-        # Resume can invalidate samples/authority: never restore stale low duty.
-        try:
-            provenance_fence.close()
-        finally:
-            _write_both(MAX_RAW, 100)
-        provenance_fence.mark_full()
-        print('Keyboard lighting: stale/invalid fan targets; protective full duty',
+        # The lighting transaction already selected firmware automatic mode.
+        # Leave it there rather than restoring stale targets or forcing full.
+        _invalidate_failed_write()
+        print('Keyboard lighting: stale/invalid fan targets; no fan override',
               file=sys.__stderr__, flush=True)
         return
     write_raw(MODE, 2)
@@ -328,7 +325,7 @@ def _apply_key_raw(raw: int) -> None:
             fail("keyboard-light register readback mismatch")
     except BaseException:
         if manual:
-            _failed_write_full()
+            _invalidate_failed_write()
         raise
 
 
@@ -447,8 +444,6 @@ def read_live_power_state():
 
 def current_control_snapshot():
     data = read_snapshot(require_metadata=True, require_samples=True)
-    if critical_temperature(data):
-        raise ValueError('critical temperature')
     if read_live_power_state() != (data['gpu_state'], data['gpu_power_state']):
         raise ValueError('current PCI power mode differs from snapshot')
     return data
@@ -524,8 +519,8 @@ def quiet_hand_over(live_policy=None, *, startup=False, shutdown=False):
             if live_policy is None:
                 live_policy = state['hold_policy']
         elif state['phase'] == 'closed':
-            if state.get('full_confirmed') is True:
-                return provenance_fence.status()  # Already full; do not claim a hold.
+            if state.get('full_confirmed') is True or state.get('override_disabled') is True:
+                return provenance_fence.status()  # No writes or invented duty confirmation.
             raise ValueError('invalid last applied duty')
         else:
             provenance_fence.check_authority(state)
@@ -565,7 +560,7 @@ def raise_hold_floor(data):
             state['last_duty'] = min((v - 1) * 100 // 69 for v in new)
         provenance_fence._atomic(None, state)
     except BaseException:
-        _failed_write_full()
+        _invalidate_failed_write()
         raise
 
 
@@ -573,7 +568,6 @@ def set_both(raw: int, label=None, duty=None) -> None:
     if not isinstance(raw, int) or isinstance(raw, bool) or not MIN_COMMAND <= raw <= MAX_RAW:
         fail(f"fan command must be in {MIN_COMMAND}..{MAX_RAW}")
     guarded(require_control=True)
-    rejection = None
     applied = 100
     if raw < MAX_RAW or label is not None:
         try:
@@ -595,19 +589,11 @@ def set_both(raw: int, label=None, duty=None) -> None:
         except DutyHeld:
             raise
         except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
-            rejection = exc
-            raw, applied = MAX_RAW, 100
-            try:
-                provenance_fence.close()
-            except OSError:
-                # A failed state write must not prevent best-effort full duty.
-                # Future low writes still have to persist their reserved ID.
-                pass
+            _invalidate_failed_write()
+            raise ValueError('lower-duty validation failed; no fan override') from exc
     _write_both(raw, applied)
-    if rejection is None and label is not None:
+    if label is not None:
         remember_safe(temperatures)
-    if rejection is not None:
-        raise ValueError('lower-duty validation failed; full duty requested') from rejection
 
 
 def _write_both(raw, applied):
@@ -622,11 +608,12 @@ def _write_both(raw, applied):
         if applied == 100:
             forget_safe()
     except BaseException:
-        _failed_write_full()
+        _invalidate_failed_write()
         raise
 
 
-def _failed_write_full():
+def _invalidate_failed_write():
+    """Forget uncertain duty and revoke authority; never issue recovery fan writes."""
     global _RISE_STATE_UNCERTAIN
     _RISE_STATE_UNCERTAIN = True
     forget_safe()
@@ -634,11 +621,6 @@ def _failed_write_full():
         provenance_fence.close()
     except OSError:
         pass
-    for index in (MODE, CPU_TARGET, GPU_TARGET):
-        try:
-            write_raw(index, 2 if index == MODE else MAX_RAW)
-        except BaseException:
-            pass
 
 
 def check_applied_duty() -> None:
@@ -774,7 +756,8 @@ def main(argv: list[str]) -> int:
         guarded(require_control=True)
         write_raw(MODE, 2)
     elif action == "reset":
-        fixed_full()
+        forget_safe()
+        provenance_fence.close()
     elif action == "temp-cpu":
         read_cpu_temp()
     elif action == "temp-gpu":

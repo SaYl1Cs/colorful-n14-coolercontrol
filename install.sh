@@ -164,8 +164,8 @@ ctl stop coolercontrold.service
 if [[ $(ctl show "$PLUGIN_UNIT" -p LoadState --value) != not-found ]]; then
   ctl stop "$PLUGIN_UNIT"
 fi
-# Confirm OLD backend full reset while OLD sensors and adapter are still alive.
-# Adapter shutdown repeats full reset before sensors are stopped.
+# Revoke OLD backend control while OLD sensors and adapter are still alive.
+# Older backends can request full on reset; the current backend does not write.
 timeout --kill-after=1s 5s "$CLIENT" reset >/dev/null
 ctl stop "$ADAPTER_UNIT"
 ctl stop "$SENSORS_UNIT"
@@ -190,4 +190,4 @@ TRANSACTION_STARTED=0
 trap - ERR INT TERM
 printf '\nInstalled EC release; global EC write policy preserved. No reboot required.\n'
 printf 'Backup and deterministic rollback: sudo bash %q --restore %q\n' "$BACKUP_ROOT/recovery/install.sh" "$BACKUP_ROOT"
-printf '%s\n' 'Stable device/profile IDs retained. CPU-only while GPU sleeps; Maximum CPU/GPU while awake. Awaiting provenance retains full duty.'
+printf '%s\n' 'Stable device/profile IDs retained. CPU-only while GPU sleeps; Maximum CPU/GPU while awake. No emergency fan override; awaiting provenance leaves targets unchanged.'

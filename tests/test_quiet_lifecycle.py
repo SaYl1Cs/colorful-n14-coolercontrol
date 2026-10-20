@@ -33,10 +33,16 @@ class QuietLifecycleTests(unittest.TestCase):
         self.assertTrue(self.h.send(self.h.api.command(80, 75)).startswith(b'OK'))
         self.h.writes.reset_mock()
 
-    def assert_full(self):
-        self.assertEqual(fence.status()['phase'], 'closed')
-        self.assertTrue(fence.status()['full_confirmed'])
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+    def assert_closed_without_override(self):
+        state = fence.status()
+        self.assertEqual(state['phase'], 'closed')
+        self.assertFalse(state['full_confirmed'])
+        self.assertTrue(state['override_disabled'])
+        self.assertNotIn('assignment', state)
+        self.assertNotIn('last_duty', state)  # No fabricated confirmation.
+        for call in self.h.writes.call_args_list:
+            if call.args[0] in (adapter.CPU_TARGET, adapter.GPU_TARGET):
+                self.assertNotEqual(call.args[1], adapter.MAX_RAW)
 
     def test_startup_reads_both_individual_targets_without_writing_or_claiming_full(self):
         state, reads = self.startup()
@@ -51,19 +57,19 @@ class QuietLifecycleTests(unittest.TestCase):
 
     def test_identity_guard_precedes_startup_readback(self):
         with patch.object(adapter, 'guarded', side_effect=SystemExit(1)), \
-                patch.object(adapter, 'read_raw') as reads, self.assertRaises(SystemExit):
+                patch.object(adapter, 'read_raw') as reads:
             server._bounded_hand_over(startup=True)
         reads.assert_not_called()
         self.h.writes.assert_not_called()
 
-    def test_startup_unknown_zero_boolean_or_uncontrolled_targets_force_full(self):
+    def test_invalid_startup_targets_revoke_without_override(self):
         for cpu, gpu, mode in ((0, 40, 2), (40, 0, 2), (71, 40, 2),
                                (True, 40, 2), (40, 40, 0)):
             with self.subTest(cpu=cpu, gpu=gpu, mode=mode):
                 self.startup(cpu, gpu, mode)
-                self.assert_full()
+                self.assert_closed_without_override()
 
-    def test_startup_missing_stale_or_critical_snapshot_forces_full(self):
+    def test_startup_missing_stale_or_critical_snapshot_never_writes(self):
         for fault in ('missing', 'stale', 'cpu', 'gpu'):
             with self.subTest(fault=fault):
                 self.h.cpu, self.h.gpu = 61000, 55000
@@ -77,7 +83,7 @@ class QuietLifecycleTests(unittest.TestCase):
                     self.h.snapshot()
                 _, reads = self.startup()
                 reads.assert_not_called()
-                self.assert_full()
+                self.assert_closed_without_override()
 
     def test_startup_deadline_is_not_rearmed_by_restart(self):
         state, _ = self.startup()
@@ -86,7 +92,7 @@ class QuietLifecycleTests(unittest.TestCase):
         self.assertEqual(again['hold_until'], state['hold_until'])
         self.h.advance(1)
         self.startup()
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_startup_to_assignment_raises_only_weaker_fan_and_keeps_deadline(self):
         before, _ = self.startup()
@@ -110,7 +116,7 @@ class QuietLifecycleTests(unittest.TestCase):
             self.assertEqual(fence.status()['hold_until'], before['hold_until'])
         self.h.advance()
         self.h.watchdog.tick()
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_first_valid_producer_write_replaces_hold_with_normal_control(self):
         self.startup()
@@ -148,7 +154,7 @@ class QuietLifecycleTests(unittest.TestCase):
         self.h.select()
         self.h.writes.assert_not_called()
         self.assertTrue(self.h.send(old).startswith(b'ERR'))
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_shutdown_reset_selector_final_and_adapter_final_share_one_deadline(self):
         self.active()
@@ -163,17 +169,17 @@ class QuietLifecycleTests(unittest.TestCase):
         self.h.writes.assert_not_called()
         self.h.advance(4)
         self.h.watchdog.tick()  # Emergency path cannot use shutdown suppression.
-        self.assert_full()
+        self.assert_closed_without_override()
 
-    def test_manual_stop_and_explicit_emergency_always_full(self):
+    def test_stop_and_legacy_close_full_never_override_fans(self):
         for command, stopping in (('reset', False), ('lifecycle-stop', False), ('fence-close-full', True)):
             with self.subTest(command=command):
                 self.active()
                 self.h.stopping.return_value = stopping
                 self.assertTrue(server.dispatch(command).startswith(b'OK'))
-                self.assert_full()
+                self.assert_closed_without_override()
 
-    def test_shutdown_unknown_duty_missing_sensor_critical_or_warm_state_is_full(self):
+    def test_shutdown_invalid_state_rejects_without_override(self):
         for fault in ('unknown', 'missing', 'critical', 'warm'):
             with self.subTest(fault=fault):
                 self.h.cpu = 61000
@@ -190,7 +196,7 @@ class QuietLifecycleTests(unittest.TestCase):
                     self.h.cpu = 90000 if fault == 'critical' else 80000
                     self.h.snapshot()
                 server.dispatch('reset')
-                self.assert_full()
+                self.assert_closed_without_override()
 
     def test_shutdown_hold_cannot_install_assignment(self):
         self.active()
@@ -200,7 +206,7 @@ class QuietLifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.h.rpc.install_assignment(self.h.api.envelope, self.h.policy(), thermal.epoch(self.h.data),
                                           state['close_id'])
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def run_service(self, *, crash=False, ready_failure=False, cleanup_failure=False, stop_during_startup=False):
         handlers = {}
@@ -222,25 +228,25 @@ class QuietLifecycleTests(unittest.TestCase):
         if stop_during_startup:
             loop.step.assert_not_called()
 
-    def test_service_ordinary_sigterm_is_full_but_confirmed_shutdown_is_quiet(self):
+    def test_service_stop_never_overrides_and_shutdown_can_preserve_hold(self):
         for startup in (False, True):
             with self.subTest(stop_during_startup=startup):
                 self.h.stopping.return_value = False
                 self.run_service(stop_during_startup=startup)
-                self.assert_full()
+                self.assert_closed_without_override()
                 self.h.writes.reset_mock()
                 self.h.stopping.return_value = True
                 self.run_service(stop_during_startup=startup)
                 self.h.writes.assert_not_called()
                 self.assertEqual(fence.status()['hold_kind'], 'shutdown')
 
-    def test_service_setup_and_runtime_exception_are_full_even_during_shutdown(self):
+    def test_service_setup_and_runtime_exception_revoke_without_override(self):
         self.h.stopping.return_value = True
         for fault in ('runtime', 'ready', 'cleanup'):
             with self.subTest(fault=fault), self.assertRaises(RuntimeError):
                 self.run_service(crash=fault == 'runtime', ready_failure=fault == 'ready',
                                  cleanup_failure=fault == 'cleanup')
-            self.assert_full()
+            self.assert_closed_without_override()
 
     def test_sensor_gap_selector_watchdog_and_valid_rejected_command_do_not_write(self):
         self.active()
@@ -258,14 +264,14 @@ class QuietLifecycleTests(unittest.TestCase):
             self.assertEqual(after[key], before[key])
         self.assertEqual(after['last_calculation_id'], command['calculation']['calculation_id'])
 
-    def test_replaying_command_rejected_during_gap_still_forces_full(self):
+    def test_replaying_command_during_gap_revokes_without_override(self):
         self.active()
         command = self.h.api.command()
         self.h.advance(sample=False)
         self.h.snapshot(error=True)
         self.assertIn(b'bounded last-duty hold', self.h.send(command))
         self.assertTrue(self.h.send(command).startswith(b'ERR'))
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_sensor_gap_recovery_uses_new_epoch_and_fresh_producer_command(self):
         self.active()
@@ -293,7 +299,7 @@ class QuietLifecycleTests(unittest.TestCase):
         self.h.advance(sample=False)
         self.h.snapshot(error=True)
         self.h.watchdog.tick()
-        self.assert_full()
+        self.assert_closed_without_override()
         self.h.rpc.sensor_check()
         self.assertNotIn('hold_until', fence.status())
 
@@ -308,14 +314,14 @@ class QuietLifecycleTests(unittest.TestCase):
         self.assertEqual(result['sensor_grace_until'], stamp + 5)
         self.h.advance(1, sample=False)
         self.h.rpc.sensor_check()
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_no_prior_safe_sample_or_known_duty_has_no_sensor_grace(self):
         self.h.snapshot(error=True)
         self.h.watchdog.tick()
-        self.assert_full()
+        self.assert_closed_without_override()
 
-    def test_sensor_loss_never_hides_critical_other_sensor(self):
+    def test_incomplete_snapshot_never_fabricates_hot_curve_inputs(self):
         for role in ('cpu', 'gpu'):
             with self.subTest(role=role):
                 self.h.cpu, self.h.gpu = 61000, 55000
@@ -329,7 +335,10 @@ class QuietLifecycleTests(unittest.TestCase):
                     self.h.snapshot()
                 self.h.watchdog.next_check = 0
                 self.h.watchdog.tick()
-                self.assert_full()
+                self.h.writes.assert_not_called()
+                self.h.advance(6, sample=False)
+                self.h.watchdog.tick()
+                self.assert_closed_without_override()
 
     def test_cpu_loss_is_typed_thermal_error_with_paired_gpu_error_metadata(self):
         self.active()
@@ -353,7 +362,7 @@ class QuietLifecycleTests(unittest.TestCase):
                 fence._atomic(None, state)
                 self.h.snapshot(error=True)
                 self.h.rpc.sensor_check()
-                self.assert_full()
+                self.assert_closed_without_override()
 
     def test_malformed_snapshot_or_command_is_not_a_thermal_grace(self):
         for fault in ('json', 'schema', 'sample', 'future', 'command'):
@@ -374,7 +383,7 @@ class QuietLifecycleTests(unittest.TestCase):
                     self.h.snapshot_path.write_text('{' if fault == 'json' else json.dumps(data))
                     self.h.watchdog.next_check = 0
                     self.h.watchdog.tick()
-                self.assert_full()
+                self.assert_closed_without_override()
 
     def test_actual_write_failure_never_gets_grace(self):
         self.active()
@@ -383,17 +392,19 @@ class QuietLifecycleTests(unittest.TestCase):
                 raise OSError('offline partial write')
         self.h.writes.side_effect = fail
         self.assertTrue(self.h.send().startswith(b'ERR'))
-        self.assert_full()
+        self.assert_closed_without_override()
         self.assertIsNone(adapter._LAST_SAFE_SNAPSHOT)
 
-    def test_handover_raise_failure_immediately_requests_full(self):
+    def test_handover_raise_failure_has_no_recovery_fan_write(self):
         self.startup()
         def fail_lower(index, raw):
             if index != adapter.MODE and raw < adapter.MAX_RAW:
                 raise OSError('offline partial handover write')
         self.h.writes.side_effect = fail_lower
         self.h.select()
-        self.assertEqual(self.h.writes.call_args.args, (adapter.GPU_TARGET, adapter.MAX_RAW))
+        # Only the originally attempted raise is allowed; no recovery fan write.
+        self.assertEqual(self.h.writes.call_count, 1)
+        self.assertNotEqual(self.h.writes.call_args.args[1], adapter.MAX_RAW)
         self.assertNotIn('hold_until', fence.status())
 
     def test_old_gpu_measurement_consumes_grace_even_with_newer_cpu_stamp(self):
@@ -404,7 +415,7 @@ class QuietLifecycleTests(unittest.TestCase):
         self.h.advance(sample=False)
         self.h.snapshot(error=True)
         self.h.rpc.sensor_check()
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_wall_clock_age_also_bounds_sensor_grace(self):
         self.active()
@@ -412,28 +423,28 @@ class QuietLifecycleTests(unittest.TestCase):
         self.h.wall += 750  # Within existing 1s discontinuity tolerance, but age is 5s.
         self.h.snapshot_path.unlink()
         self.h.rpc.sensor_check()
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_corrupt_hold_marker_or_expired_close_id_cannot_install(self):
         for key, value in (('held_raw', [0, 40]), ('held_raw', [True, 40]),
                            ('hold_until', self.h.boot), ('hold_until', self.h.boot + 11)):
             with self.subTest(key=key, value=value):
-                server._full_hand_over()
+                server._close_without_override()
                 self.startup()
                 state = fence._read()
                 state[key] = value
                 fence._atomic(None, state)
                 self.h.watchdog.next_check = 0
                 self.h.watchdog.tick()
-                self.assert_full()
+                self.assert_closed_without_override()
 
-    def test_no_caller_supplied_shutdown_flag_can_bypass_manual_full(self):
+    def test_no_caller_supplied_shutdown_flag_can_bypass_validation(self):
         self.active()
         self.assertTrue(server.dispatch('reset stopping').startswith(b'ERR'))
         self.assertNotIn('hold_until', fence.status())
         self.h.writes.assert_not_called()
         server.dispatch('reset')
-        self.assert_full()
+        self.assert_closed_without_override()
 
     def test_valid_stopped_raw_one_is_preserved_but_not_invented(self):
         state, _ = self.startup(1, 1)
@@ -447,7 +458,7 @@ class QuietLifecycleTests(unittest.TestCase):
         for stop_requested, confirmed, malformed in ((True, True, False), (True, False, False),
                                                      (False, True, False), (True, True, True)):
             with self.subTest(stop=stop_requested, confirmed=confirmed, malformed=malformed):
-                server._full_hand_over()
+                server._close_without_override()
                 self.active()
                 self.h.stopping.return_value = confirmed
                 self.h.selector._stopping = lambda: stop_requested
@@ -458,14 +469,14 @@ class QuietLifecycleTests(unittest.TestCase):
                     self.h.writes.assert_not_called()
                     self.assertEqual(fence.status()['hold_kind'], 'shutdown')
                 else:
-                    self.assert_full()
+                    self.assert_closed_without_override()
 
     def test_api_policy_failure_not_mistaken_for_sensor_grace(self):
         self.active()
         self.h.api.fail = True
         with self.assertRaises(StagedError):
             self.h.select()
-        self.assert_full()
+        self.assert_closed_without_override()
 
 
 class ShutdownObservationTests(unittest.TestCase):

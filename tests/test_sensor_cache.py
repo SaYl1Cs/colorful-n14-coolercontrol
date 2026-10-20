@@ -238,23 +238,21 @@ class ConsumerTests(unittest.TestCase):
             adapter.read_gpu_temp()
         self.assertEqual(out.getvalue(), '')
 
-    def test_watchdog_requests_full_on_invalid_data(self):
+    def test_watchdog_only_closes_authority_on_invalid_data(self):
         for error in (ValueError('active GPU invalid'), OSError('transport unavailable')):
             with patch.object(server, 'read_snapshot', side_effect=error), \
                     patch.object(server, 'dispatch', return_value=b'OK ok\n') as dispatch:
                 server.ThermalWatchdog().tick()
-                dispatch.assert_called_once_with('fence-close-full')
+                dispatch.assert_called_once_with('fence-close')
 
-    def test_low_command_promoted_to_full_on_sensor_error(self):
+    def test_sensor_error_rejects_command_without_any_fan_write(self):
         from protocol_fixtures import Harness
         harness = Harness()
         self.addCleanup(harness.close)
         with patch.object(adapter, 'read_snapshot', side_effect=ValueError('failed')):
             with self.assertRaises(ValueError):
                 adapter.set_both(adapter.MIN_COMMAND)
-        self.assertEqual([c.args for c in harness.writes.call_args_list],
-                         [(adapter.MODE, 2), (adapter.CPU_TARGET, adapter.MAX_RAW),
-                          (adapter.GPU_TARGET, adapter.MAX_RAW)])
+        harness.writes.assert_not_called()
 
 
 if __name__ == '__main__':

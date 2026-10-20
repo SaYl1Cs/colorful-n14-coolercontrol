@@ -1,5 +1,12 @@
 # Quiet lifecycle handover and bounded sensor-loss grace
 
+> **Current behavior supersedes the historical full-duty fallbacks below.**
+> Emergency fan overrides are removed: errors and expired holds only revoke
+> authority, without changing fan speed. Fresh control can recover without a
+> full-duty handshake. See [no-override policy and risks](NO-EMERGENCY-OVERRIDE.md).
+> The original timing rules and earlier deployment observations below are retained
+> as engineering history, not a claim that emergency cooling is still enabled.
+
 **Installed on the development laptop on 2026-10-16.** Live idle verification
 confirmed D3cold with CPU-only control and clean logs; an actual reboot/acoustic
 check remains outstanding. See [DEPLOYMENT-VERIFICATION.md](DEPLOYMENT-VERIFICATION.md)
